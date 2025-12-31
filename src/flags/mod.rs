@@ -1,5 +1,5 @@
 /// Configuration flags that modify the behavior of the regular expression engine.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct Flags {
     /// Controls case sensitivity.
     /// - `None`: Smartcase (case-insensitive if pattern is all lowercase, sensitive otherwise).
