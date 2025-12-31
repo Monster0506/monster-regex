@@ -468,7 +468,7 @@ impl Parser {
             // Capturing group
             self.group_count += 1;
             let index = self.group_count;
-            let nodes = self.parse_sequence()?;
+            let nodes = self.parse_alternation()?;
             self.expect_close_paren()?;
             Ok(AstNode::Group {
                 nodes,
@@ -483,7 +483,7 @@ impl Parser {
         match self.current() {
             Some(&':') => {
                 self.consume()?;
-                let nodes = self.parse_sequence()?;
+                let nodes = self.parse_alternation()?;
                 self.expect_close_paren()?;
                 Ok(AstNode::Group {
                     nodes,
@@ -498,7 +498,7 @@ impl Parser {
                 match self.current() {
                     Some(&'=') => {
                         self.consume()?;
-                        let nodes = self.parse_sequence()?;
+                        let nodes = self.parse_alternation()?;
                         self.expect_close_paren()?;
                         Ok(AstNode::LookBehind {
                             nodes,
@@ -507,7 +507,7 @@ impl Parser {
                     }
                     Some(&'!') => {
                         self.consume()?;
-                        let nodes = self.parse_sequence()?;
+                        let nodes = self.parse_alternation()?;
                         self.expect_close_paren()?;
                         Ok(AstNode::LookBehind {
                             nodes,
@@ -525,7 +525,7 @@ impl Parser {
                         self.group_count += 1;
                         let index = self.group_count;
 
-                        let nodes = self.parse_sequence()?;
+                        let nodes = self.parse_alternation()?;
                         self.expect_close_paren()?;
                         Ok(AstNode::Group {
                             nodes,
@@ -541,7 +541,7 @@ impl Parser {
                 match self.current() {
                     Some(&'=') => {
                         self.consume()?;
-                        let nodes = self.parse_sequence()?;
+                        let nodes = self.parse_alternation()?;
                         self.expect_close_paren()?;
                         Ok(AstNode::LookAhead {
                             nodes,
@@ -550,7 +550,7 @@ impl Parser {
                     }
                     Some(&'!') => {
                         self.consume()?;
-                        let nodes = self.parse_sequence()?;
+                        let nodes = self.parse_alternation()?;
                         self.expect_close_paren()?;
                         Ok(AstNode::LookAhead {
                             nodes,
