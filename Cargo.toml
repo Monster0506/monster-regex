@@ -4,5 +4,6 @@ description = "A custom regex spec"
 version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/monster0506/monster-regex"
 
 [dependencies]
