@@ -438,10 +438,18 @@ impl<'a> Matcher<'a> {
             CharClass::Whitespace => c.is_whitespace(),
             CharClass::NonWhitespace => !c.is_whitespace(),
             CharClass::Dot => self.flags.dotall || c != '\n',
-            CharClass::Lowercase => c.is_lowercase(),
-            CharClass::NonLowercase => !c.is_lowercase(),
-            CharClass::Uppercase => c.is_uppercase(),
-            CharClass::NonUppercase => !c.is_uppercase(),
+            CharClass::Lowercase => {
+                c.is_lowercase() || (self.flags.ignore_case.unwrap_or(false) && c.is_uppercase())
+            }
+            CharClass::NonLowercase => {
+                !c.is_lowercase() && (!self.flags.ignore_case.unwrap_or(false) || !c.is_uppercase())
+            }
+            CharClass::Uppercase => {
+                c.is_uppercase() || (self.flags.ignore_case.unwrap_or(false) && c.is_lowercase())
+            }
+            CharClass::NonUppercase => {
+                !c.is_uppercase() && (!self.flags.ignore_case.unwrap_or(false) || !c.is_lowercase())
+            }
             CharClass::Hex => c.is_ascii_hexdigit(),
             CharClass::NonHex => !c.is_ascii_hexdigit(),
             CharClass::Octal => c.is_digit(8),
@@ -453,7 +461,25 @@ impl<'a> Matcher<'a> {
             CharClass::WordStart => c.is_alphabetic() || c == '_',
             CharClass::NonWordStart => !(c.is_alphabetic() || c == '_'),
             CharClass::Set { chars, negated } => {
-                let found = chars.iter().any(|range| c >= range.start && c <= range.end);
+                let ignore_case = self.flags.ignore_case.unwrap_or(false);
+                let found = chars.iter().any(|range| {
+                    if c >= range.start && c <= range.end {
+                        return true;
+                    }
+                    if ignore_case {
+                        if c.to_lowercase()
+                            .any(|lc| lc >= range.start && lc <= range.end)
+                        {
+                            return true;
+                        }
+                        if c.to_uppercase()
+                            .any(|uc| uc >= range.start && uc <= range.end)
+                        {
+                            return true;
+                        }
+                    }
+                    false
+                });
                 if *negated { !found } else { found }
             }
         }
