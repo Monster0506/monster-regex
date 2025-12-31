@@ -101,6 +101,9 @@ These anchors match at a specific position in the buffer. They are zero-width as
 | Anchor | Meaning | Example |
 | :--- | :--- | :--- |
 | `\%nl` | Matches anywhere on line *n* (1-indexed). | `\%5lfoo` matches "foo" only if it appears on line 5. |
+
+
+Not implemented in the parser, clients must handle line-based matching.
 | `\%nc` | Matches at column *n* (1-indexed). | `\%5cfoo` matches "foo" starting at column 5. |
 | `\%#` | Matches at the current cursor position. | `\%#foo` matches "foo" starting exactly under the cursor. |
 
