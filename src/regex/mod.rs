@@ -88,7 +88,13 @@ impl Regex {
     /// # Returns
     ///
     /// Returns a `Result` containing the compiled `Regex` or a `CompileError` if the pattern is invalid.
-    pub fn new(pattern: &str, flags: Flags) -> Result<Self, CompileError> {
+    pub fn new(pattern: &str, mut flags: Flags) -> Result<Self, CompileError> {
+        // Smartcase: if no explicit case flag, infer from pattern
+        if flags.ignore_case.is_none() {
+            let has_uppercase = pattern.chars().any(|c| c.is_uppercase());
+            flags.ignore_case = Some(!has_uppercase);
+        }
+
         let mut parser = Parser::new(pattern, flags);
         let ast = parser
             .parse()

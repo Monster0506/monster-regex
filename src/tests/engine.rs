@@ -205,12 +205,12 @@ fn test_standard_classes() {
 fn test_extended_classes() {
     // \l Lowercase
     assert_match(r"\l", "a");
-    assert_no_match(r"\l", "A");
+    assert_match(r"\l", "A"); // Smartcase
     assert_no_match(r"\l", "0");
 
     // \u Uppercase
     assert_match(r"\u", "A");
-    assert_no_match(r"\u", "a");
+    assert_match(r"\u", "a"); // Smartcase
 
     // \x Hex digit
     assert_match(r"\x", "a");
@@ -287,7 +287,7 @@ fn test_custom_sets() {
 
     // Ranges
     assert_match("[a-z]", "m");
-    assert_no_match("[a-z]", "M"); // Default is case sensitive in current impl
+    assert_match("[a-z]", "M"); // Smartcase
 
     // Force case sensitive
     let mut flags = Flags::default();
