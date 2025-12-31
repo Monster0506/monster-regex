@@ -15,3 +15,7 @@ mod captures;
 #[cfg(test)]
 #[path = "regex_stubs.rs"]
 mod regex_stubs;
+
+#[cfg(test)]
+#[path = "parser.rs"]
+mod parser;
