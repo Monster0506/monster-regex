@@ -1,6 +1,8 @@
 [package]
 name = "monster-regex"
-version = "0.1.0"
+description = "A custom regex spec"
+version = "0.1.0-alpha"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
