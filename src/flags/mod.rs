@@ -1,4 +1,5 @@
 /// Configuration flags that modify the behavior of the regular expression engine.
+#[derive(Default)]
 pub struct Flags {
     /// Controls case sensitivity.
     /// - `None`: Smartcase (case-insensitive if pattern is all lowercase, sensitive otherwise).
@@ -18,15 +19,3 @@ pub struct Flags {
     pub global: bool,
 }
 
-impl Default for Flags {
-    fn default() -> Self {
-        Flags {
-            ignore_case: None,
-            multiline: false,
-            dotall: false,
-            verbose: false,
-            unicode: false,
-            global: false,
-        }
-    }
-}
