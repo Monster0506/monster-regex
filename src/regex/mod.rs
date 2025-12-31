@@ -89,7 +89,7 @@ impl Regex {
     ///
     /// Returns a `Result` containing the compiled `Regex` or a `CompileError` if the pattern is invalid.
     pub fn new(pattern: &str, flags: Flags) -> Result<Self, CompileError> {
-        let mut parser = Parser::new(pattern, flags.unicode);
+        let mut parser = Parser::new(pattern, flags);
         let ast = parser
             .parse()
             .map_err(|e| CompileError::InvalidPattern(e.to_string()))?;

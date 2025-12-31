@@ -2,14 +2,14 @@ use super::*;
 
 #[test]
 fn test_literal() {
-    let mut p = Parser::new("abc", false);
+    let mut p = Parser::new("abc", Flags::default());
     let ast = p.parse().unwrap();
     assert_eq!(ast.len(), 3);
 }
 
 #[test]
 fn test_dot() {
-    let mut p = Parser::new("a.c", false);
+    let mut p = Parser::new("a.c", Flags::default());
     let ast = p.parse().unwrap();
     assert_eq!(ast.len(), 3);
     assert!(matches!(ast[1], AstNode::CharClass(CharClass::Dot)));
@@ -17,7 +17,7 @@ fn test_dot() {
 
 #[test]
 fn test_quantifiers() {
-    let mut p = Parser::new("a+", false);
+    let mut p = Parser::new("a+", Flags::default());
     let ast = p.parse().unwrap();
     assert_eq!(ast.len(), 1);
     assert!(matches!(ast[0], AstNode::OneOrMore { .. }));
@@ -25,14 +25,14 @@ fn test_quantifiers() {
 
 #[test]
 fn test_char_class() {
-    let mut p = Parser::new("[a-z]", false);
+    let mut p = Parser::new("[a-z]", Flags::default());
     let ast = p.parse().unwrap();
     assert_eq!(ast.len(), 1);
 }
 
 #[test]
 fn test_group() {
-    let mut p = Parser::new("(abc)", false);
+    let mut p = Parser::new("(abc)", Flags::default());
     let ast = p.parse().unwrap();
     assert_eq!(ast.len(), 1);
     assert!(matches!(ast[0], AstNode::Group { .. }));
@@ -40,7 +40,7 @@ fn test_group() {
 
 #[test]
 fn test_escape_classes() {
-    let mut p = Parser::new(r"\d\w\s", false);
+    let mut p = Parser::new(r"\d\w\s", Flags::default());
     let ast = p.parse().unwrap();
     assert_eq!(ast.len(), 3);
 }
@@ -48,12 +48,12 @@ fn test_escape_classes() {
 #[test]
 fn test_lookarounds() {
     // Positive lookahead (?>=...)
-    let mut p = Parser::new("(?>=abc)", false);
+    let mut p = Parser::new("(?>=abc)", Flags::default());
     let ast = p.parse().unwrap();
     assert!(matches!(ast[0], AstNode::LookAhead { positive: true, .. }));
 
     // Negative lookahead (?>!...)
-    let mut p = Parser::new("(?>!abc)", false);
+    let mut p = Parser::new("(?>!abc)", Flags::default());
     let ast = p.parse().unwrap();
     assert!(matches!(
         ast[0],
@@ -64,12 +64,12 @@ fn test_lookarounds() {
     ));
 
     // Positive lookbehind (?<=...)
-    let mut p = Parser::new("(?<=abc)", false);
+    let mut p = Parser::new("(?<=abc)", Flags::default());
     let ast = p.parse().unwrap();
     assert!(matches!(ast[0], AstNode::LookBehind { positive: true, .. }));
 
     // Negative lookbehind (?<!...)
-    let mut p = Parser::new("(?<!abc)", false);
+    let mut p = Parser::new("(?<!abc)", Flags::default());
     let ast = p.parse().unwrap();
     assert!(matches!(
         ast[0],

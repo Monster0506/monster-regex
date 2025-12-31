@@ -1,3 +1,4 @@
+use crate::flags::Flags;
 use std::fmt;
 
 /// Represents a node in the Abstract Syntax Tree (AST) of a regular expression.
@@ -171,7 +172,7 @@ pub struct CharRange {
 pub struct Parser {
     input: Vec<char>,
     pos: usize,
-    _unicode: bool,
+    flags: Flags,
     group_count: usize,
 }
 
@@ -231,11 +232,11 @@ impl std::error::Error for ParseError {}
 
 impl Parser {
     /// Creates a new parser for the given pattern.
-    pub fn new(pattern: &str, unicode: bool) -> Self {
+    pub fn new(pattern: &str, flags: Flags) -> Self {
         Parser {
             input: pattern.chars().collect(),
             pos: 0,
-            _unicode: unicode,
+            flags,
             group_count: 0,
         }
     }
@@ -264,13 +265,33 @@ impl Parser {
         }
     }
 
+    fn skip_whitespace_and_comments(&mut self) {
+        if !self.flags.verbose {
+            return;
+        }
+        while self.pos < self.input.len() {
+            let ch = self.input[self.pos];
+            if ch.is_whitespace() {
+                self.pos += 1;
+            } else if ch == '#' {
+                self.pos += 1;
+                while self.pos < self.input.len() && self.input[self.pos] != '\n' {
+                    self.pos += 1;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
     // Parse sequence of atoms with quantifiers
     fn parse_sequence(&mut self) -> Result<Vec<AstNode>, ParseError> {
         let mut nodes = vec![];
 
-        while let Some(&ch) = self.current() {
-            match ch {
-                '|' | ')' => break,
+        loop {
+            self.skip_whitespace_and_comments();
+            match self.current() {
+                Some(&'|') | Some(&')') | None => break,
                 _ => {
                     let node = self.parse_atom()?;
                     let node = self.apply_quantifier(node)?;
@@ -648,6 +669,7 @@ impl Parser {
 
     // Apply quantifiers: *, +, ?, {n}, {n,m}, etc
     fn apply_quantifier(&mut self, node: AstNode) -> Result<AstNode, ParseError> {
+        self.skip_whitespace_and_comments();
         match self.current() {
             Some(&'*') => {
                 self.consume()?;
