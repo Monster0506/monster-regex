@@ -15,20 +15,18 @@ fn test_regex_methods_existence() {
     let re = Regex::new("abc", flags).unwrap();
     let text = "abc def abc";
 
-    // These assertions match the current stub implementation (returning None/false)
-    // ensuring the API is wired up correctly even if logic is missing.
-    assert_eq!(re.is_match(text), false);
-    assert!(re.find(text).is_none());
+    assert_eq!(re.is_match(text), true);
+    assert!(re.find(text).is_some());
     assert!(re.captures(text).is_none());
 
     let matches: Vec<_> = re.find_all(text).collect();
-    assert!(matches.is_empty());
+    assert!(matches.len() == 2);
 
     let captures: Vec<_> = re.captures_all(text).collect();
     assert!(captures.is_empty());
 
-    assert_eq!(re.replace(text, "XYZ"), text);
-    assert_eq!(re.replace_all(text, "XYZ"), text);
+    assert_eq!(re.replace(text, "XYZ"), "XYZ def abc");
+    assert_eq!(re.replace_all(text, "XYZ"), "XYZ def XYZ");
 }
 
 #[test]

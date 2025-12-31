@@ -72,6 +72,8 @@ pub enum AstNode {
         name: Option<String>,
         /// Whether this group captures text.
         capture: bool,
+        /// The index of the capture group (1-based), if capturing.
+        index: Option<usize>,
     },
     /// Alternation `|`.
     Alternation(Vec<Vec<AstNode>>),
@@ -170,6 +172,7 @@ pub struct Parser {
     input: Vec<char>,
     pos: usize,
     _unicode: bool,
+    group_count: usize,
 }
 
 /// Errors that can occur during parsing.
@@ -233,6 +236,7 @@ impl Parser {
             input: pattern.chars().collect(),
             pos: 0,
             _unicode: unicode,
+            group_count: 0,
         }
     }
 
@@ -462,12 +466,15 @@ impl Parser {
             self.parse_extended_group()
         } else {
             // Capturing group
+            self.group_count += 1;
+            let index = self.group_count;
             let nodes = self.parse_sequence()?;
             self.expect_close_paren()?;
             Ok(AstNode::Group {
                 nodes,
                 name: None,
                 capture: true,
+                index: Some(index),
             })
         }
     }
@@ -482,6 +489,7 @@ impl Parser {
                     nodes,
                     name: None,
                     capture: false,
+                    index: None,
                 })
             }
             Some(&'<') => {
@@ -513,12 +521,17 @@ impl Parser {
                             return Err(ParseError::InvalidGroupName("expected '>'".to_string()));
                         }
                         self.consume()?;
+
+                        self.group_count += 1;
+                        let index = self.group_count;
+
                         let nodes = self.parse_sequence()?;
                         self.expect_close_paren()?;
                         Ok(AstNode::Group {
                             nodes,
                             name: Some(name),
                             capture: true,
+                            index: Some(index),
                         })
                     }
                 }

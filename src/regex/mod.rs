@@ -1,6 +1,8 @@
 use crate::captures::{Captures, Match};
+use crate::engine::Matcher;
 use crate::errors::CompileError;
 use crate::flags::Flags;
+use crate::parser::{AstNode, Parser};
 
 /// An iterator over all non-overlapping matches of a regex in a string.
 ///
@@ -72,7 +74,7 @@ impl<'a> Iterator for CapturesIterator<'a> {
 pub struct Regex {
     pattern: String,
     flags: Flags,
-    // Internal compiled representation
+    ast: Vec<AstNode>,
 }
 
 impl Regex {
@@ -87,10 +89,15 @@ impl Regex {
     ///
     /// Returns a `Result` containing the compiled `Regex` or a `CompileError` if the pattern is invalid.
     pub fn new(pattern: &str, flags: Flags) -> Result<Self, CompileError> {
-        // TODO: Validate and compile pattern
+        let mut parser = Parser::new(pattern, flags.unicode);
+        let ast = parser
+            .parse()
+            .map_err(|e| CompileError::InvalidPattern(e.to_string()))?;
+
         Ok(Regex {
             pattern: pattern.to_string(),
             flags,
+            ast,
         })
     }
 
@@ -104,9 +111,9 @@ impl Regex {
     /// Finds the first occurrence of the regex in the text.
     ///
     /// Returns `Some(Match)` if a match is found, or `None` otherwise.
-    pub fn find(&self, _text: &str) -> Option<Match> {
-        // TODO: Implement matching
-        None
+    pub fn find(&self, text: &str) -> Option<Match> {
+        let matcher = Matcher::new(&self.ast, &self.flags, text);
+        matcher.find()
     }
 
     /// Returns an iterator over all non-overlapping matches in the text.
@@ -123,7 +130,7 @@ impl Regex {
     /// Returns `Some(Captures)` if a match is found, containing the full match and any captured groups.
     /// Returns `None` if no match is found.
     pub fn captures(&self, _text: &str) -> Option<Captures> {
-        // TODO: Implement with group extraction
+        // TODO: Implement with group extraction in Matcher
         None
     }
 
