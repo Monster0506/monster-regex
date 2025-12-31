@@ -23,3 +23,7 @@ mod parser;
 #[cfg(test)]
 #[path = "engine.rs"]
 mod engine;
+
+#[cfg(test)]
+#[path = "flags.rs"]
+mod flags;
