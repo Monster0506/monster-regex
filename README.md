@@ -63,6 +63,21 @@ fn main() {
 }
 ```
 
+### Find All
+
+```rust
+use monster_regex::{Regex, Flags};
+
+fn main() {
+    let re = Regex::new(r"\d+", Flags::default()).unwrap();
+    let text = "123 abc 456";
+
+    for m in re.find_all(text) {
+        println!("Match: {}", &text[m.start..m.end]);
+    }
+}
+```
+
 ### Replacement
 
 ```rust
