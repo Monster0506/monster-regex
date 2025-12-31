@@ -379,9 +379,33 @@ fn test_flags_case_sensitivity() {
     assert!(!re.is_match("ABC"));
 }
 
-// Verbose flag not implemented in parser
-// #[test]
-// fn test_flags_verbose() { ... }
+#[test]
+fn test_flags_verbose() {
+    let mut flags = Flags::default();
+    flags.verbose = true;
+
+    // Spaces ignored
+    let re = Regex::new("foo bar", flags.clone()).unwrap();
+    assert!(re.is_match("foobar"));
+    assert!(!re.is_match("foo bar"));
+
+    // Escaped space matches space
+    let re = Regex::new(r"foo\ bar", flags.clone()).unwrap();
+    assert!(re.is_match("foo bar"));
+
+    // Space in brackets matches space
+    let re = Regex::new(r"foo[ ]bar", flags.clone()).unwrap();
+    assert!(re.is_match("foo bar"));
+
+    // Comments
+    let re = Regex::new(
+        r"foo # comment
+bar",
+        flags,
+    )
+    .unwrap();
+    assert!(re.is_match("foobar"));
+}
 
 // --- 6. Alternation & Grouping ---
 
@@ -395,9 +419,23 @@ fn test_alternation() {
     assert_find("a|ab", "ab", "a"); // First alternative matches 'a'
 }
 
-// Grouping with parens seems to have parser issues in current build
-// #[test]
-// fn test_grouping() { ... }
+#[test]
+fn test_grouping() {
+    assert_match("(abc)", "abc");
+    assert_match("(abc)+", "abcabc");
+    assert_find("(a(b)c)", "abc", "abc");
+}
+
+#[test]
+fn test_non_capturing_group() {
+    assert_match("(?:abc)", "abc");
+    assert_match("(?:abc)+", "abcabc");
+}
+
+#[test]
+fn test_named_group() {
+    assert_match("(?<name>abc)", "abc");
+}
 
 // --- 7. Lookarounds ---
 
@@ -421,6 +459,29 @@ fn test_lookbehind() {
     // Negative (?<!...)
     assert_find("(?<!foo)bar", "bazbar", "bar");
     assert_no_match("(?<!foo)bar", "foobar");
+}
+
+#[test]
+fn test_complex_lookarounds() {
+    // Lookahead with quantifier inside
+    println!("1");
+    assert_find(r"foo(?>=\d+)", "foo123", "foo");
+    println!("2");
+    assert_no_match(r"foo(?>=\d+)", "foobar");
+
+    // Lookbehind with alternation
+    println!("3");
+    assert_find(r"(?<=a|b)c", "ac", "c");
+    println!("4");
+    assert_find(r"(?<=a|b)c", "bc", "c");
+    println!("5");
+    assert_no_match(r"(?<=a|b)c", "dc");
+
+    // Nested lookarounds
+    println!("6");
+    assert_find(r"foo(?>=bar(?>=baz))", "foobarbaz", "foo");
+    println!("7");
+    assert_no_match(r"foo(?>=bar(?>=baz))", "foobarqux");
 }
 
 // --- 8. Replacement ---
