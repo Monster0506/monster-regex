@@ -16,6 +16,9 @@ The following characters have special meaning and must be escaped with `\` to be
 
 All other characters match themselves literally.
 
+**Note on Dot (`.`):**
+By default, `.` matches any character except newline. Use the `s` (dotall) flag to make `.` match newlines.
+
 ### Case Sensitivity
 *   **Default (Smartcase)**: Case-insensitive if the pattern contains only lowercase letters. Case-sensitive if the pattern contains any uppercase letters.
 *   **Overrides**: Can be explicitly set using the `i` (ignore-case) or `c` (case-sensitive) flags.
@@ -73,7 +76,10 @@ Quantifiers specify how many times the preceding atom (character, group, or char
 *   **With `u` flag**: These classes include Unicode characters (e.g., `\w` matches accented characters).
 
 ### Character Sets
-Custom character sets and ranges (e.g., `[a-z]`, `[^0-9]`) are supported but not formally documented here.
+Custom character sets and ranges (e.g., `[a-z]`, `[^0-9]`) are supported.
+
+**Note on Escaping in Character Classes:**
+In character classes, special meaning is different. For example, `[\]]` matches a literal `]`, and `[a\-z]` matches `a`, `\`, or `-`.
 
 ## 4. Anchors and Boundaries
 
@@ -90,18 +96,20 @@ Anchors assert a position without matching characters (zero-width).
 | `\ze` | Sets the end of the match (everything after is excluded from the result) |
 
 ### Position Anchors
-| Anchor | Meaning |
-| :--- | :--- |
-| `\%l` | Matches at a specific line number (e.g., `\%5l` matches on line 5) |
-| `\%c` | Matches at a specific column number (e.g., `\%5c` matches at column 5) |
-| `\%#` | Matches at the current cursor position |
+These anchors match at a specific position in the buffer. They are zero-width assertions and do not consume characters.
+
+| Anchor | Meaning | Example |
+| :--- | :--- | :--- |
+| `\%nl` | Matches anywhere on line *n* (1-indexed). | `\%5lfoo` matches "foo" only if it appears on line 5. |
+| `\%nc` | Matches at column *n* (1-indexed). | `\%5cfoo` matches "foo" starting at column 5. |
+| `\%#` | Matches at the current cursor position. | `\%#foo` matches "foo" starting exactly under the cursor. |
 
 ### Word Boundaries Explained
 *   `\<`: Matches the position where a word starts (preceded by non-word, followed by word char).
 *   `\>`: Matches the position where a word ends (preceded by word char, followed by non-word).
 *   `\b`: Matches at either `\<` or `\>`.
 
-**Word Definition**: A "word" consists of characters in `[a-zA-Z0-9_]`. Boundaries occur between a word character and a non-word character (or start/end of input).
+Word boundaries `\<` and `\>` use the same character definition as `\w` (`[a-zA-Z0-9_]`). With the `u` flag, both adapt to Unicode.
 
 ## 5. Flags
 
@@ -138,8 +146,8 @@ Flags are appended after the pattern delimiter (e.g., `pattern/flags`).
 *   **Alternation**: `pattern1|pattern2` matches either *pattern1* or *pattern2*.
 *   **Grouping**: `(pattern)` groups part of the regex and captures it.
 *   **Named Capture**: `(?<name>pattern)` captures the group with a specific name.
-*  **Non-Capturing Group**: `(?:pattern)` groups without capturing.
-*   **Backreferences**: `\1`, `\2`, `\3`... refer to previously captured groups by index.
+*   **Non-Capturing Group**: `(?:pattern)` groups without capturing.
+*   **Backreferences**: `\1` through `\9` refer to captured groups 1-9. `\0` refers to the entire match.
 
 ### Lookaround Assertions
 Lookarounds assert that what follows or precedes the current position matches a pattern, without including it in the match result.
