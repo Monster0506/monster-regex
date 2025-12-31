@@ -19,3 +19,7 @@ mod regex_stubs;
 #[cfg(test)]
 #[path = "parser.rs"]
 mod parser;
+
+#[cfg(test)]
+#[path = "engine.rs"]
+mod engine;

@@ -1,5 +1,4 @@
-use monster_regex::{Flags, Regex};
-
+use super::{Flags, Regex};
 // --- Helper Functions ---
 
 fn assert_match(pattern: &str, text: &str) {
@@ -80,6 +79,15 @@ fn test_special_characters_escaped() {
     assert_match(r"\{", "{");
     assert_match(r"\}", "}");
     assert_match(r"\\", "\\");
+}
+
+#[test]
+fn test_escape_sequences() {
+    assert_match(r"\n", "\n");
+    assert_match(r"\t", "\t");
+    assert_match(r"\r", "\r");
+    assert_match(r"\f", "\x0C");
+    assert_match(r"\v", "\x0B");
 }
 
 #[test]
@@ -215,6 +223,59 @@ fn test_extended_classes() {
     assert_match(r"\a", "0");
     assert_no_match(r"\a", "_");
     assert_no_match(r"\a", "!");
+
+    // \L Non-lowercase
+    assert_match(r"\L", "A");
+    assert_match(r"\L", "0");
+    assert_no_match(r"\L", "a");
+
+    // \U Non-uppercase
+    assert_match(r"\U", "a");
+    assert_match(r"\U", "0");
+    assert_no_match(r"\U", "A");
+
+    // \X Non-hex digit
+    assert_match(r"\X", "g");
+    assert_no_match(r"\X", "a");
+    assert_no_match(r"\X", "F");
+    assert_no_match(r"\X", "0");
+
+    // \o Octal digit
+    assert_match(r"\o", "0");
+    assert_match(r"\o", "7");
+    assert_no_match(r"\o", "8");
+
+    // \O Non-octal digit
+    assert_match(r"\O", "8");
+    assert_match(r"\O", "a");
+    assert_no_match(r"\O", "0");
+
+    // \h Head of word character (start of a word)
+    assert_match(r"\h", "a");
+    assert_match(r"\h", "_");
+    assert_no_match(r"\h", "0");
+
+    // \H Non-head of word character
+    assert_match(r"\H", "0");
+    assert_match(r"\H", "!");
+    assert_no_match(r"\H", "a");
+
+    // \p Punctuation
+    assert_match(r"\p", "!");
+    assert_match(r"\p", ".");
+    assert_no_match(r"\p", "a");
+    assert_no_match(r"\p", "0");
+
+    // \P Non-punctuation
+    assert_match(r"\P", "a");
+    assert_match(r"\P", "0");
+    assert_no_match(r"\P", "!");
+
+    // \A Non-alphanumeric
+    assert_match(r"\A", "_");
+    assert_match(r"\A", "!");
+    assert_no_match(r"\A", "a");
+    assert_no_match(r"\A", "0");
 }
 
 #[test]
@@ -301,6 +362,23 @@ fn test_flags_multiline() {
     assert_no_match("^bar", "foo\nbar");
 }
 
+#[test]
+fn test_flags_case_sensitivity() {
+    // i flag (ignore-case)
+    let mut flags = Flags::default();
+    flags.ignore_case = Some(true);
+    let re = Regex::new("abc", flags).unwrap();
+    assert!(re.is_match("ABC"));
+    assert!(re.is_match("AbC"));
+
+    // c flag (case-sensitive)
+    let mut flags = Flags::default();
+    flags.ignore_case = Some(false);
+    let re = Regex::new("abc", flags).unwrap();
+    assert!(re.is_match("abc"));
+    assert!(!re.is_match("ABC"));
+}
+
 // Verbose flag not implemented in parser
 // #[test]
 // fn test_flags_verbose() { ... }
@@ -323,11 +401,27 @@ fn test_alternation() {
 
 // --- 7. Lookarounds ---
 
-// Lookarounds not implemented in parser
-// #[test]
-// fn test_lookahead() { ... }
-// #[test]
-// fn test_lookbehind() { ... }
+#[test]
+fn test_lookahead() {
+    // Positive (?>=...)
+    assert_find("foo(?>=bar)", "foobar", "foo");
+    assert_no_match("foo(?>=bar)", "foobaz");
+
+    // Negative (?>!...)
+    assert_find("foo(?>!bar)", "foobaz", "foo");
+    assert_no_match("foo(?>!bar)", "foobar");
+}
+
+#[test]
+fn test_lookbehind() {
+    // Positive (?<=...)
+    assert_find("(?<=foo)bar", "foobar", "bar");
+    assert_no_match("(?<=foo)bar", "bazbar");
+
+    // Negative (?<!...)
+    assert_find("(?<!foo)bar", "bazbar", "bar");
+    assert_no_match("(?<!foo)bar", "foobar");
+}
 
 // --- 8. Replacement ---
 
