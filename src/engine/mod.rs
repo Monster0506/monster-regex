@@ -205,16 +205,16 @@ impl<'a> Matcher<'a> {
                 ..
             } => {
                 let start_capture = pos;
-                if let Some(next_pos) = self.match_nodes(group_nodes, pos, ctx)
-                    && *capture
-                    && let Some(idx) = index
-                    && *idx < ctx.captures.len()
-                {
-                    ctx.captures[*idx] = Some(Match {
-                        start: start_capture,
-                        end: next_pos,
-                    });
-
+                if let Some(next_pos) = self.match_nodes(group_nodes, pos, ctx) {
+                    if *capture && index.is_some() {
+                        let idx = index.unwrap();
+                        if idx < ctx.captures.len() {
+                            ctx.captures[idx] = Some(Match {
+                                start: start_capture,
+                                end: next_pos,
+                            });
+                        }
+                    }
                     self.match_nodes(remaining, next_pos, ctx)
                 } else {
                     None
