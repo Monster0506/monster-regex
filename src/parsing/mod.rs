@@ -1,6 +1,31 @@
-// Helper: Parse Rift format "pattern/flags"
 use crate::errors::ParseError;
 use crate::flags::Flags;
+
+/// Parses a string in the Rift format: `pattern/flags`.
+///
+/// This format expects the pattern to be terminated by a forward slash `/`,
+/// followed by any number of single-character flags.
+///
+/// # Flags
+///
+/// * `i`: Ignore case (case-insensitive).
+/// * `c`: Case-sensitive.
+/// * `m`: Multiline mode (`^` and `$` match line boundaries).
+/// * `s`: Dotall mode (`.` matches newlines).
+/// * `x`: Verbose mode (whitespace and comments ignored).
+/// * `u`: Unicode support.
+/// * `g`: Global match.
+///
+/// # Smartcase
+///
+/// If neither `i` nor `c` is specified, the case sensitivity is inferred:
+/// * If the pattern contains any uppercase characters, it defaults to case-sensitive.
+/// * Otherwise, it defaults to case-insensitive.
+///
+/// # Errors
+///
+/// Returns `ParseError::NoDelimiter` if the input string does not contain a `/`.
+/// Returns `ParseError::InvalidFlags` if an unknown flag character is encountered.
 pub fn parse_rift_format(input: &str) -> Result<(String, Flags), ParseError> {
     let last_slash = input.rfind('/').ok_or(ParseError::NoDelimiter)?;
 

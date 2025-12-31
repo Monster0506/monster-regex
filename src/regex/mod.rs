@@ -2,7 +2,9 @@ use crate::captures::{Captures, Match};
 use crate::errors::CompileError;
 use crate::flags::Flags;
 
-// Iterators
+/// An iterator over all non-overlapping matches of a regex in a string.
+///
+/// Yields `Match` objects.
 pub struct FindAllIterator<'a> {
     text: &'a str,
     regex: &'a Regex,
@@ -26,6 +28,9 @@ impl<'a> Iterator for FindAllIterator<'a> {
     }
 }
 
+/// An iterator over all non-overlapping capture groups of a regex in a string.
+///
+/// Yields `Captures` objects.
 pub struct CapturesIterator<'a> {
     text: &'a str,
     regex: &'a Regex,
@@ -63,7 +68,9 @@ impl<'a> Iterator for CapturesIterator<'a> {
     }
 }
 
-// Main regex type
+/// A compiled regular expression.
+///
+/// This struct represents a parsed and compiled regex pattern, ready to be used for matching against text.
 pub struct Regex {
     pattern: String,
     flags: Flags,
@@ -71,7 +78,16 @@ pub struct Regex {
 }
 
 impl Regex {
-    /// Compile a regex pattern with explicit flags
+    /// Compiles a regex pattern with the specified flags.
+    ///
+    /// # Arguments
+    ///
+    /// * `pattern` - The regex pattern string.
+    /// * `flags` - Configuration flags for the regex engine.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing the compiled `Regex` or a `CompileError` if the pattern is invalid.
     pub fn new(pattern: &str, flags: Flags) -> Result<Self, CompileError> {
         // TODO: Validate and compile pattern
         Ok(Regex {
@@ -80,18 +96,22 @@ impl Regex {
         })
     }
 
-    /// Check if text matches anywhere
+    /// Checks if the regex matches anywhere in the given text.
+    ///
+    /// Returns `true` if a match is found, `false` otherwise.
     pub fn is_match(&self, text: &str) -> bool {
         self.find(text).is_some()
     }
 
-    /// Find first match
+    /// Finds the first occurrence of the regex in the text.
+    ///
+    /// Returns `Some(Match)` if a match is found, or `None` otherwise.
     pub fn find(&self, _text: &str) -> Option<Match> {
         // TODO: Implement matching
         None
     }
 
-    /// Find all matches (lazy iterator)
+    /// Returns an iterator over all non-overlapping matches in the text.
     pub fn find_all<'a>(&'a self, text: &'a str) -> FindAllIterator<'a> {
         FindAllIterator {
             text,
@@ -100,13 +120,16 @@ impl Regex {
         }
     }
 
-    /// Get captures from first match
+    /// Finds the first match and returns the capture groups.
+    ///
+    /// Returns `Some(Captures)` if a match is found, containing the full match and any captured groups.
+    /// Returns `None` if no match is found.
     pub fn captures(&self, _text: &str) -> Option<Captures> {
         // TODO: Implement with group extraction
         None
     }
 
-    /// Get captures from all matches (lazy iterator)
+    /// Returns an iterator over all non-overlapping matches, yielding capture groups for each match.
     pub fn captures_all<'a>(&'a self, text: &'a str) -> CapturesIterator<'a> {
         CapturesIterator {
             text,
@@ -115,7 +138,9 @@ impl Regex {
         }
     }
 
-    /// Replace first match
+    /// Replaces the first match in the text with the replacement string.
+    ///
+    /// If no match is found, returns the original text.
     pub fn replace(&self, text: &str, replacement: &str) -> String {
         if let Some(m) = self.find(text) {
             let mut result = String::with_capacity(text.len());
@@ -128,7 +153,7 @@ impl Regex {
         }
     }
 
-    /// Replace all matches
+    /// Replaces all non-overlapping matches in the text with the replacement string.
     pub fn replace_all(&self, text: &str, replacement: &str) -> String {
         let mut result = String::with_capacity(text.len() * 2);
         let mut last_end = 0;
@@ -143,12 +168,12 @@ impl Regex {
         result
     }
 
-    /// Access the original pattern
+    /// Returns the original pattern string used to compile this regex.
     pub fn pattern(&self) -> &str {
         &self.pattern
     }
 
-    /// Access the flags
+    /// Returns the flags used to compile this regex.
     pub fn flags(&self) -> &Flags {
         &self.flags
     }
