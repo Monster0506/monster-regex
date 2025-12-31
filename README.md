@@ -2,6 +2,79 @@
 
 This document outlines the regular expression syntax and features supported by Rift's search engine.
 
+## Usage
+
+Add `monster-regex` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+monster-regex = "0.1.0"
+```
+
+### Basic Example
+
+```rust
+use monster_regex::{Regex, Flags};
+
+fn main() {
+    // Compile a regex
+    let re = Regex::new(r"\w+", Flags::default()).unwrap();
+
+    // Check for a match
+    assert!(re.is_match("hello"));
+
+    // Find a match
+    if let Some(m) = re.find("hello world") {
+        println!("Found match at {}-{}", m.start, m.end); // 0-5
+    }
+}
+```
+
+### Using Flags
+
+You can configure behavior using `Flags`:
+
+```rust
+use monster_regex::{Regex, Flags};
+
+fn main() {
+    let mut flags = Flags::default();
+    flags.ignore_case = Some(true); // Case insensitive
+    flags.multiline = true;         // ^ and $ match line boundaries
+
+    let re = Regex::new(r"^hello", flags).unwrap();
+    assert!(re.is_match("HELLO\nworld"));
+}
+```
+
+### Parsing Rift Format
+
+You can also parse patterns in the `pattern/flags` format used by Rift:
+
+```rust
+use monster_regex::parse_rift_format;
+use monster_regex::Regex;
+
+fn main() {
+    let (pattern, flags) = parse_rift_format("abc/i").unwrap();
+    let re = Regex::new(&pattern, flags).unwrap();
+
+    assert!(re.is_match("ABC"));
+}
+```
+
+### Replacement
+
+```rust
+use monster_regex::{Regex, Flags};
+
+fn main() {
+    let re = Regex::new(r"foo", Flags::default()).unwrap();
+    let result = re.replace_all("foo bar foo", "baz");
+    assert_eq!(result, "baz bar baz");
+}
+```
+
 ## 1. General Syntax
 
 Search patterns are entered in the format:
