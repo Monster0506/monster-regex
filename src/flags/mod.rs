@@ -1,5 +1,5 @@
 /// Configuration flags that modify the behavior of the regular expression engine.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct Flags {
     /// Controls case sensitivity.
     /// - `None`: Smartcase (case-insensitive if pattern is all lowercase, sensitive otherwise).
@@ -18,4 +18,3 @@ pub struct Flags {
     /// Note: This flag is often handled by the caller (e.g., `find_all` vs `find`), but is preserved here for parsing.
     pub global: bool,
 }
-
