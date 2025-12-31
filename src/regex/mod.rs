@@ -53,11 +53,9 @@ impl<'a> Iterator for CapturesIterator<'a> {
         let mut adjusted_caps = caps;
         adjusted_caps.full_match.start += offset;
         adjusted_caps.full_match.end += offset;
-        for group in &mut adjusted_caps.groups {
-            if let Some(m) = group {
-                m.start += offset;
-                m.end += offset;
-            }
+        for m in &mut adjusted_caps.groups.iter_mut().flatten() {
+            m.start += offset;
+            m.end += offset;
         }
         for m in adjusted_caps.named.values_mut() {
             m.start += offset;
