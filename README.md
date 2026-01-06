@@ -90,6 +90,43 @@ fn main() {
 }
 ```
 
+### Streaming / Zero-Copy Search
+
+For advanced use cases like searching non-contiguous memory (ropes, gap buffers) without allocation, implement the `Haystack` trait:
+
+```rust
+use monster_regex::{Regex, Haystack};
+
+#[derive(Copy, Clone)]
+struct MyRope<'a> {
+    // ... custom internal structure
+    phantom: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> Haystack for MyRope<'a> {
+    fn len(&self) -> usize { /* ... */ }
+    fn char_at(&self, pos: usize) -> Option<(char, usize)> { /* ... */ }
+    fn char_before(&self, pos: usize) -> Option<char> { /* ... */ }
+    fn matches_range(&self, pos: usize, other_start: usize, other_end: usize) -> bool { /* ... */ }
+    fn starts_with(&self, pos: usize, literal: &str) -> bool { /* ... */ }
+}
+
+fn main() {
+    let rope = MyRope { /* ... */ };
+    let re = Regex::new("pattern", Default::default()).unwrap();
+
+    // Find generic match
+    if let Some(m) = re.find_from(rope) {
+         println!("Match at {}-{}", m.start, m.end);
+    }
+
+    // Iterate all matches
+    for m in re.find_all_from(rope) {
+        // ...
+    }
+}
+```
+
 ## 1. General Syntax
 
 Search patterns are entered in the format:
