@@ -2,11 +2,13 @@ use crate::captures::Match;
 use crate::flags::Flags;
 use crate::parser::{AstNode, CharClass};
 
+use crate::haystack::Haystack;
+
 /// The matching engine that walks the AST to find matches in text.
-pub struct Matcher<'a> {
+pub struct Matcher<'a, H: Haystack> {
     nodes: &'a [AstNode],
     flags: &'a Flags,
-    text: &'a str,
+    text: H,
 }
 
 struct QuantifierParams {
@@ -32,33 +34,45 @@ impl MatchContext {
     }
 }
 
-impl<'a> Matcher<'a> {
+impl<'a, H: Haystack> Matcher<'a, H> {
     /// Creates a new Matcher instance.
-    pub fn new(nodes: &'a [AstNode], flags: &'a Flags, text: &'a str) -> Self {
+    pub fn new(nodes: &'a [AstNode], flags: &'a Flags, text: H) -> Self {
         Self { nodes, flags, text }
     }
 
     /// Finds the first match in the text.
     pub fn find(&self) -> Option<Match> {
+        self.find_at(0)
+    }
+
+    /// Finds the first match in the text starting at the given position.
+    pub fn find_at(&self, start_index: usize) -> Option<Match> {
         // Determine max group index for context sizing
         let max_group = self.count_groups(self.nodes);
 
         // Try to match starting at every character boundary
-        for (start_pos, _) in self.text.char_indices() {
+        let mut pos = start_index;
+        let len = self.text.len();
+
+        while pos <= len {
             let mut context = MatchContext::new(max_group);
-            if let Some(end_pos) = self.match_nodes(self.nodes, start_pos, &mut context) {
-                let start = context.match_start_override.unwrap_or(start_pos);
+            if let Some(end_pos) = self.match_nodes(self.nodes, pos, &mut context) {
+                let start = context.match_start_override.unwrap_or(pos);
                 let end = context.match_end_override.unwrap_or(end_pos);
                 return Some(Match { start, end });
             }
-        }
 
-        // Also try matching at the very end of the string (for empty matches or anchors)
-        let mut context = MatchContext::new(max_group);
-        if let Some(end_pos) = self.match_nodes(self.nodes, self.text.len(), &mut context) {
-            let start = context.match_start_override.unwrap_or(self.text.len());
-            let end = context.match_end_override.unwrap_or(end_pos);
-            return Some(Match { start, end });
+            // Advance to next char
+            if pos < len {
+                if let Some((_, char_len)) = self.text.char_at(pos) {
+                    pos += char_len;
+                } else {
+                    // Should not happen if pos < len and valid utf8
+                    pos += 1;
+                }
+            } else {
+                break;
+            }
         }
 
         None
@@ -112,23 +126,27 @@ impl<'a> Matcher<'a> {
                 }
 
                 let matches = if self.flags.ignore_case.unwrap_or(false) {
-                    let current_char = self.text[pos..].chars().next()?;
+                    let (current_char, _) = self.text.char_at(pos)?;
                     c.to_lowercase().eq(current_char.to_lowercase())
                 } else {
-                    self.text[pos..].starts_with(*c)
+                    // Optimized path: check if haystack starts with char
+                    match self.text.char_at(pos) {
+                        Some((ch, _)) => ch == *c,
+                        None => false,
+                    }
                 };
 
                 if matches {
-                    let next_pos = pos + self.text[pos..].chars().next()?.len_utf8();
+                    let next_pos = pos + char_len;
                     self.match_nodes(remaining, next_pos, ctx)
                 } else {
                     None
                 }
             }
             AstNode::CharClass(class) => {
-                let current_char = self.text[pos..].chars().next()?;
+                let (current_char, len) = self.text.char_at(pos)?;
                 if self.match_char_class(class, current_char) {
-                    self.match_nodes(remaining, pos + current_char.len_utf8(), ctx)
+                    self.match_nodes(remaining, pos + len, ctx)
                 } else {
                     None
                 }
@@ -136,7 +154,7 @@ impl<'a> Matcher<'a> {
             AstNode::StartAnchor => {
                 let is_start = pos == 0;
                 let is_line_start =
-                    self.flags.multiline && pos > 0 && self.text.as_bytes()[pos - 1] == b'\n';
+                    self.flags.multiline && pos > 0 && self.text.char_before(pos) == Some('\n');
                 if is_start || is_line_start {
                     self.match_nodes(remaining, pos, ctx)
                 } else {
@@ -147,7 +165,7 @@ impl<'a> Matcher<'a> {
                 let is_end = pos == self.text.len();
                 let is_line_end = self.flags.multiline
                     && pos < self.text.len()
-                    && self.text.as_bytes()[pos] == b'\n';
+                    && self.text.char_at(pos).map(|(c, _)| c) == Some('\n');
                 if is_end || is_line_end {
                     self.match_nodes(remaining, pos, ctx)
                 } else {
@@ -222,9 +240,8 @@ impl<'a> Matcher<'a> {
             }
             AstNode::Backref(idx) => {
                 if let Some(Some(m)) = ctx.captures.get(*idx) {
-                    let captured_text = &self.text[m.start..m.end];
-                    if self.text[pos..].starts_with(captured_text) {
-                        self.match_nodes(remaining, pos + captured_text.len(), ctx)
+                    if self.text.matches_range(pos, m.start, m.end) {
+                        self.match_nodes(remaining, pos + (m.end - m.start), ctx)
                     } else {
                         None
                     }
@@ -487,19 +504,17 @@ impl<'a> Matcher<'a> {
 
     fn is_word_boundary(&self, pos: usize) -> bool {
         let is_word_char_before = if pos > 0 {
-            self.text[..pos]
-                .chars()
-                .last()
+            self.text
+                .char_before(pos)
                 .is_some_and(|c| self.is_word_char(c))
         } else {
             false
         };
 
         let is_word_char_after = if pos < self.text.len() {
-            self.text[pos..]
-                .chars()
-                .next()
-                .is_some_and(|c| self.is_word_char(c))
+            self.text
+                .char_at(pos)
+                .is_some_and(|(c, _)| self.is_word_char(c))
         } else {
             false
         };
@@ -509,10 +524,9 @@ impl<'a> Matcher<'a> {
 
     fn is_word_char_at(&self, pos: usize) -> bool {
         if pos < self.text.len() {
-            self.text[pos..]
-                .chars()
-                .next()
-                .is_some_and(|c| self.is_word_char(c))
+            self.text
+                .char_at(pos)
+                .is_some_and(|(c, _)| self.is_word_char(c))
         } else {
             false
         }

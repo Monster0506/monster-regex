@@ -2,6 +2,7 @@ pub mod captures;
 pub mod engine;
 pub mod errors;
 pub mod flags;
+pub mod haystack;
 pub mod parser;
 pub mod parsing;
 pub mod regex;

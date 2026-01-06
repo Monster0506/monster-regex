@@ -2,7 +2,30 @@ use crate::captures::{Captures, Match};
 use crate::engine::Matcher;
 use crate::errors::CompileError;
 use crate::flags::Flags;
+use crate::haystack::Haystack;
 use crate::parser::{AstNode, Parser};
+
+/// An iterator over all non-overlapping matches of a regex in a haystack.
+///
+/// Yields `Match` objects.
+pub struct FindMatchesIterator<'a, H: Haystack> {
+    text: H,
+    regex: &'a Regex,
+    last_end: usize,
+}
+
+impl<'a, H: Haystack> Iterator for FindMatchesIterator<'a, H> {
+    type Item = Match;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.last_end > self.text.len() {
+            return None;
+        }
+        let m = self.regex.find_from_at(self.text, self.last_end)?;
+        self.last_end = m.end.max(m.start + 1);
+        Some(m)
+    }
+}
 
 /// An iterator over all non-overlapping matches of a regex in a string.
 ///
@@ -114,17 +137,42 @@ impl Regex {
         self.find(text).is_some()
     }
 
+    /// Checks if the regex matches anywhere in the given haystack.
+    pub fn is_match_from<H: Haystack>(&self, text: H) -> bool {
+        self.find_from(text).is_some()
+    }
+
     /// Finds the first occurrence of the regex in the text.
     ///
     /// Returns `Some(Match)` if a match is found, or `None` otherwise.
     pub fn find(&self, text: &str) -> Option<Match> {
+        self.find_from(text)
+    }
+
+    /// Finds the first occurrence of the regex in the haystack.
+    pub fn find_from<H: Haystack>(&self, text: H) -> Option<Match> {
         let matcher = Matcher::new(&self.ast, &self.flags, text);
         matcher.find()
+    }
+
+    /// Finds the first occurrence of the regex in the haystack starting at the given position.
+    pub fn find_from_at<H: Haystack>(&self, text: H, start: usize) -> Option<Match> {
+        let matcher = Matcher::new(&self.ast, &self.flags, text);
+        matcher.find_at(start)
     }
 
     /// Returns an iterator over all non-overlapping matches in the text.
     pub fn find_all<'a>(&'a self, text: &'a str) -> FindAllIterator<'a> {
         FindAllIterator {
+            text,
+            regex: self,
+            last_end: 0,
+        }
+    }
+
+    /// Returns an iterator over all non-overlapping matches in the haystack.
+    pub fn find_all_from<'a, H: Haystack>(&'a self, text: H) -> FindMatchesIterator<'a, H> {
+        FindMatchesIterator {
             text,
             regex: self,
             last_end: 0,

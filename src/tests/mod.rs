@@ -27,3 +27,6 @@ mod engine;
 #[cfg(test)]
 #[path = "flags.rs"]
 mod flags;
+
+#[cfg(test)]
+mod streaming;
