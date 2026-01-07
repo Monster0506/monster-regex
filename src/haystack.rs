@@ -2,6 +2,8 @@
 /// This abstraction allows searching over non-contiguous memory (like ropes)
 /// without flattening to a single string.
 pub trait Haystack: Copy + Clone {
+    type Cursor: HaystackCursor;
+
     /// Total length of the haystack in bytes
     fn len(&self) -> usize;
 
@@ -9,23 +11,30 @@ pub trait Haystack: Copy + Clone {
         self.len() == 0
     }
 
-    /// Get the char at the specified byte position
-    /// Returns (char, len_in_bytes)
+    /// Get a cursor for streaming access starting at `pos`
+    fn cursor_at(&self, pos: usize) -> Self::Cursor;
+
+    /// Get character at position
     fn char_at(&self, pos: usize) -> Option<(char, usize)>;
 
-    /// Get the char/byte length *before* the specified position.
-    /// Useful for lookbehind and boundary checks.
+    /// Get character before position
     fn char_before(&self, pos: usize) -> Option<char>;
 
-    /// Check if the haystack starts with the literal string at the given position
+    /// Check if haystack starts with literal at pos
     fn starts_with(&self, pos: usize, literal: &str) -> bool;
 
-    /// Check if the range at `pos` matches the content of the range `other_start..other_end`
-    /// Used for backreferences.
+    /// Check if range matches another range
     fn matches_range(&self, pos: usize, other_start: usize, other_end: usize) -> bool;
 }
 
+pub trait HaystackCursor: Iterator<Item = char> + Clone {
+    /// Peek at the next character without advancing
+    fn peek(&self) -> Option<char>;
+}
+
 impl<'a> Haystack for &'a str {
+    type Cursor = StrCursor<'a>;
+
     #[inline]
     fn len(&self) -> usize {
         str::len(self)
@@ -63,5 +72,33 @@ impl<'a> Haystack for &'a str {
         }
         let substring = &self[other_start..other_end];
         self.starts_with(pos, substring)
+    }
+
+    #[inline]
+    fn cursor_at(&self, pos: usize) -> Self::Cursor {
+        StrCursor {
+            chars: self[pos..].chars(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct StrCursor<'a> {
+    chars: std::str::Chars<'a>,
+}
+
+impl<'a> Iterator for StrCursor<'a> {
+    type Item = char;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.chars.next()
+    }
+}
+
+impl<'a> HaystackCursor for StrCursor<'a> {
+    #[inline]
+    fn peek(&self) -> Option<char> {
+        self.chars.clone().next()
     }
 }
