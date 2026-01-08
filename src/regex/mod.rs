@@ -1,42 +1,161 @@
 use crate::captures::{Captures, Match};
-use crate::engine::backtracking::Matcher;
+use crate::engine::backtracking::BacktrackingRegexEngine;
+use crate::engine::linear::LinearRegexEngine;
+use crate::engine::{CompiledRegex, CompiledRegexHaystack, RegexEngine};
 use crate::errors::CompileError;
 use crate::flags::Flags;
 use crate::haystack::Haystack;
-use crate::parser::{AstNode, Parser};
+// use crate::parser::AstNode;
+// BacktrackingRegex exposes ast, compiled linear regex exposes nfa.
+// Regex struct just holds compiled.
+
+/// A compiled regular expression.
+///
+/// This struct represents a parsed and compiled regex pattern, ready to be used for matching against text.
+pub struct Regex<E: RegexEngine = BacktrackingRegexEngine> {
+    compiled: E::Regex,
+}
+
+impl Regex<BacktrackingRegexEngine> {
+    /// Compiles a regex pattern with the specified flags using the default Backtracking engine.
+    pub fn new(pattern: &str, flags: Flags) -> Result<Self, CompileError> {
+        let engine = BacktrackingRegexEngine;
+        let compiled = engine.compile(pattern, flags)?;
+        Ok(Regex { compiled })
+    }
+}
+
+impl Regex<LinearRegexEngine> {
+    /// Compiles a regex pattern with the specified flags using the Linear engine.
+    pub fn new_linear(pattern: &str, flags: Flags) -> Result<Self, CompileError> {
+        let engine = LinearRegexEngine;
+        let compiled = engine.compile(pattern, flags)?;
+        Ok(Regex { compiled })
+    }
+}
+
+impl<E: RegexEngine> Regex<E> {
+    /// Checks if the regex matches anywhere in the given text.
+    pub fn is_match(&self, text: &str) -> bool {
+        self.compiled.is_match(text)
+    }
+
+    /// Checks if the regex matches anywhere in the given haystack.
+    pub fn is_match_from<H: Haystack>(&self, text: H) -> bool
+    where
+        E::Regex: crate::engine::CompiledRegexHaystack,
+    {
+        self.compiled.is_match_from(text)
+    }
+
+    /// Finds the first occurrence of the regex in the text.
+    pub fn find(&self, text: &str) -> Option<Match> {
+        self.compiled.find(text)
+    }
+
+    /// Finds the first occurrence of the regex in the haystack.
+    pub fn find_from<H: Haystack>(&self, text: H) -> Option<Match>
+    where
+        E::Regex: crate::engine::CompiledRegexHaystack,
+    {
+        self.compiled.find_from(text)
+    }
+
+    /// Finds the first occurrence of the regex in the haystack starting at the given position.
+    pub fn find_from_at<H: Haystack>(&self, text: H, start: usize) -> Option<Match>
+    where
+        E::Regex: crate::engine::CompiledRegexHaystack,
+    {
+        self.compiled.find_from_at(text, start)
+    }
+
+    /// Returns an iterator over all non-overlapping matches in the text.
+    pub fn find_all<'a>(&'a self, text: &'a str) -> FindAllIterator<'a, E> {
+        FindAllIterator {
+            text,
+            regex: self,
+            last_end: 0,
+        }
+    }
+
+    /// Returns an iterator over all non-overlapping matches in the haystack.
+    pub fn find_all_from<'a, H: Haystack>(&'a self, text: H) -> FindMatchesIterator<'a, H, E>
+    where
+        E::Regex: crate::engine::CompiledRegexHaystack,
+    {
+        FindMatchesIterator {
+            text,
+            regex: self,
+            last_end: 0,
+        }
+    }
+
+    /// Finds the first match and returns the capture groups.
+    pub fn captures(&self, text: &str) -> Option<Captures> {
+        self.compiled.captures(text)
+    }
+
+    /// Returns an iterator yielding capture groups for each match.
+    pub fn captures_all<'a>(&'a self, text: &'a str) -> CapturesIterator<'a, E> {
+        CapturesIterator {
+            text,
+            regex: self,
+            last_end: 0,
+        }
+    }
+
+    /// Replaces the first match in the text with the replacement string.
+    pub fn replace(&self, text: &str, replacement: &str) -> String {
+        self.compiled.replace(text, replacement)
+    }
+
+    /// Replaces all non-overlapping matches in the text with the replacement string.
+    pub fn replace_all(&self, text: &str, replacement: &str) -> String {
+        self.compiled.replace_all(text, replacement)
+    }
+
+    /// Returns the original pattern string used to compile this regex.
+    pub fn pattern(&self) -> &str {
+        self.compiled.pattern()
+    }
+
+    /// Returns the flags used to compile this regex.
+    pub fn flags(&self) -> &Flags {
+        self.compiled.flags()
+    }
+}
 
 /// An iterator over all non-overlapping matches of a regex in a haystack.
-///
-/// Yields `Match` objects.
-pub struct FindMatchesIterator<'a, H: Haystack> {
+pub struct FindMatchesIterator<'a, H: Haystack, E: RegexEngine> {
     text: H,
-    regex: &'a Regex,
+    regex: &'a Regex<E>,
     last_end: usize,
 }
 
-impl<'a, H: Haystack> Iterator for FindMatchesIterator<'a, H> {
+impl<'a, H: Haystack, E: RegexEngine> Iterator for FindMatchesIterator<'a, H, E>
+where
+    E::Regex: crate::engine::CompiledRegexHaystack,
+{
     type Item = Match;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.last_end > self.text.len() {
             return None;
         }
-        let m = self.regex.find_from_at(self.text, self.last_end)?;
+        let m = self.regex.find_from_at(self.text.clone(), self.last_end)?;
         self.last_end = m.end.max(m.start + 1);
         Some(m)
     }
 }
 
 /// An iterator over all non-overlapping matches of a regex in a string.
-///
-/// Yields `Match` objects.
-pub struct FindAllIterator<'a> {
+pub struct FindAllIterator<'a, E: RegexEngine> {
     text: &'a str,
-    regex: &'a Regex,
+    regex: &'a Regex<E>,
     last_end: usize,
 }
 
-impl<'a> Iterator for FindAllIterator<'a> {
+impl<'a, E: RegexEngine> Iterator for FindAllIterator<'a, E> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -54,15 +173,13 @@ impl<'a> Iterator for FindAllIterator<'a> {
 }
 
 /// An iterator over all non-overlapping capture groups of a regex in a string.
-///
-/// Yields `Captures` objects.
-pub struct CapturesIterator<'a> {
+pub struct CapturesIterator<'a, E: RegexEngine> {
     text: &'a str,
-    regex: &'a Regex,
+    regex: &'a Regex<E>,
     last_end: usize,
 }
 
-impl<'a> Iterator for CapturesIterator<'a> {
+impl<'a, E: RegexEngine> Iterator for CapturesIterator<'a, E> {
     type Item = Captures;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -88,152 +205,5 @@ impl<'a> Iterator for CapturesIterator<'a> {
         }
 
         Some(adjusted_caps)
-    }
-}
-
-/// A compiled regular expression.
-///
-/// This struct represents a parsed and compiled regex pattern, ready to be used for matching against text.
-pub struct Regex {
-    pattern: String,
-    flags: Flags,
-    ast: Vec<AstNode>,
-}
-
-impl Regex {
-    /// Compiles a regex pattern with the specified flags.
-    ///
-    /// # Arguments
-    ///
-    /// * `pattern` - The regex pattern string.
-    /// * `flags` - Configuration flags for the regex engine.
-    ///
-    /// # Returns
-    ///
-    /// Returns a `Result` containing the compiled `Regex` or a `CompileError` if the pattern is invalid.
-    pub fn new(pattern: &str, mut flags: Flags) -> Result<Self, CompileError> {
-        // Smartcase: if no explicit case flag, infer from pattern
-        if flags.ignore_case.is_none() {
-            let has_uppercase = pattern.chars().any(|c| c.is_uppercase());
-            flags.ignore_case = Some(!has_uppercase);
-        }
-
-        let mut parser = Parser::new(pattern, flags);
-        let ast = parser
-            .parse()
-            .map_err(|e| CompileError::InvalidPattern(e.to_string()))?;
-
-        Ok(Regex {
-            pattern: pattern.to_string(),
-            flags,
-            ast,
-        })
-    }
-
-    /// Checks if the regex matches anywhere in the given text.
-    ///
-    /// Returns `true` if a match is found, `false` otherwise.
-    pub fn is_match(&self, text: &str) -> bool {
-        self.find(text).is_some()
-    }
-
-    /// Checks if the regex matches anywhere in the given haystack.
-    pub fn is_match_from<H: Haystack>(&self, text: H) -> bool {
-        self.find_from(text).is_some()
-    }
-
-    /// Finds the first occurrence of the regex in the text.
-    ///
-    /// Returns `Some(Match)` if a match is found, or `None` otherwise.
-    pub fn find(&self, text: &str) -> Option<Match> {
-        self.find_from(text)
-    }
-
-    /// Finds the first occurrence of the regex in the haystack.
-    pub fn find_from<H: Haystack>(&self, text: H) -> Option<Match> {
-        let matcher = Matcher::new(&self.ast, &self.flags, text);
-        matcher.find()
-    }
-
-    /// Finds the first occurrence of the regex in the haystack starting at the given position.
-    pub fn find_from_at<H: Haystack>(&self, text: H, start: usize) -> Option<Match> {
-        let matcher = Matcher::new(&self.ast, &self.flags, text);
-        matcher.find_at(start)
-    }
-
-    /// Returns an iterator over all non-overlapping matches in the text.
-    pub fn find_all<'a>(&'a self, text: &'a str) -> FindAllIterator<'a> {
-        FindAllIterator {
-            text,
-            regex: self,
-            last_end: 0,
-        }
-    }
-
-    /// Returns an iterator over all non-overlapping matches in the haystack.
-    pub fn find_all_from<'a, H: Haystack>(&'a self, text: H) -> FindMatchesIterator<'a, H> {
-        FindMatchesIterator {
-            text,
-            regex: self,
-            last_end: 0,
-        }
-    }
-
-    /// Finds the first match and returns the capture groups.
-    ///
-    /// Returns `Some(Captures)` if a match is found, containing the full match and any captured groups.
-    /// Returns `None` if no match is found.
-    pub fn captures(&self, _text: &str) -> Option<Captures> {
-        // TODO: Implement with group extraction in Matcher
-        None
-    }
-
-    /// Returns an iterator over all non-overlapping matches, yielding capture groups for each match.
-    pub fn captures_all<'a>(&'a self, text: &'a str) -> CapturesIterator<'a> {
-        CapturesIterator {
-            text,
-            regex: self,
-            last_end: 0,
-        }
-    }
-
-    /// Replaces the first match in the text with the replacement string.
-    ///
-    /// If no match is found, returns the original text.
-    pub fn replace(&self, text: &str, replacement: &str) -> String {
-        if let Some(m) = self.find(text) {
-            let mut result = String::with_capacity(text.len());
-            result.push_str(&text[..m.start]);
-            result.push_str(replacement);
-            result.push_str(&text[m.end..]);
-            result
-        } else {
-            text.to_string()
-        }
-    }
-
-    /// Replaces all non-overlapping matches in the text with the replacement string.
-    pub fn replace_all(&self, text: &str, replacement: &str) -> String {
-        let mut result = String::with_capacity(text.len() * 2);
-        let mut last_end = 0;
-
-        for m in self.find_all(text) {
-            result.push_str(&text[last_end..m.start]);
-            result.push_str(replacement);
-            last_end = m.end;
-        }
-
-        result.push_str(&text[last_end..]);
-        result
-    }
-
-    /// Returns the original pattern string used to compile this regex.
-    pub fn pattern(&self) -> &str {
-        &self.pattern
-    }
-
-    /// Returns the flags used to compile this regex.
-    pub fn flags(&self) -> &Flags {
-        &self.flags
     }
 }

@@ -689,3 +689,162 @@ impl<'a, H: Haystack> Matcher<'a, H> {
         c.is_alphanumeric() || c == '_'
     }
 }
+
+use crate::engine::{CompiledRegex, CompiledRegexHaystack, RegexEngine};
+use crate::errors::CompileError;
+use crate::parser::Parser;
+// use std::sync::Arc; // Not needed if we clone explicitly
+
+/// The backtracking regex engine.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BacktrackingRegexEngine;
+
+impl RegexEngine for BacktrackingRegexEngine {
+    type Regex = BacktrackingRegex;
+
+    fn compile(&self, pattern: &str, flags: Flags) -> Result<Self::Regex, CompileError> {
+        BacktrackingRegex::new(pattern, flags)
+    }
+}
+
+/// A compiled regex using the backtracking engine.
+#[derive(Clone, Debug)]
+pub struct BacktrackingRegex {
+    ast: Vec<AstNode>,
+    flags: Flags,
+    pattern: String,
+}
+
+impl BacktrackingRegex {
+    /// Compiles a new backtracking regex.
+    pub fn new(pattern: &str, mut flags: Flags) -> Result<Self, CompileError> {
+        // Smartcase: if no explicit case flag, infer from pattern
+        if flags.ignore_case.is_none() {
+            let has_uppercase = pattern.chars().any(|c| c.is_uppercase());
+            flags.ignore_case = Some(!has_uppercase);
+        }
+
+        let mut parser = Parser::new(pattern, flags);
+        let ast = parser
+            .parse()
+            .map_err(|e| CompileError::InvalidPattern(e.to_string()))?;
+
+        Ok(BacktrackingRegex {
+            ast,
+            flags,
+            pattern: pattern.to_string(),
+        })
+    }
+}
+
+impl CompiledRegex for BacktrackingRegex {
+    fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
+    fn flags(&self) -> &Flags {
+        &self.flags
+    }
+
+    fn is_match(&self, text: &str) -> bool {
+        self.is_match_from(text)
+    }
+
+    fn find(&self, text: &str) -> Option<Match> {
+        self.find_from(text)
+    }
+
+    fn find_all<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = Match> + 'a> {
+        Box::new(FindMatchesIterator {
+            text,
+            regex: self,
+            last_end: 0,
+        })
+    }
+
+    fn captures(&self, _text: &str) -> Option<crate::captures::Captures> {
+        // TODO: Implement capture extraction in Matcher
+        None
+    }
+
+    fn captures_all<'a>(
+        &'a self,
+        _text: &'a str,
+    ) -> Box<dyn Iterator<Item = crate::captures::Captures> + 'a> {
+        // TODO: Implement captures iterator
+        Box::new(std::iter::empty())
+    }
+
+    fn replace(&self, text: &str, replacement: &str) -> String {
+        if let Some(m) = self.find(text) {
+            let mut result = String::with_capacity(text.len());
+            result.push_str(&text[..m.start]);
+            result.push_str(replacement);
+            result.push_str(&text[m.end..]);
+            result
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn replace_all(&self, text: &str, replacement: &str) -> String {
+        let mut result = String::with_capacity(text.len() * 2);
+        let mut last_end = 0;
+
+        for m in self.find_all(text) {
+            result.push_str(&text[last_end..m.start]);
+            result.push_str(replacement);
+            last_end = m.end;
+        }
+
+        result.push_str(&text[last_end..]);
+        result
+    }
+}
+
+impl crate::engine::CompiledRegexHaystack for BacktrackingRegex {
+    fn is_match_from<H: Haystack>(&self, haystack: H) -> bool {
+        self.find_from(haystack).is_some()
+    }
+
+    fn find_from<H: Haystack>(&self, haystack: H) -> Option<Match> {
+        let matcher = Matcher::new(&self.ast, &self.flags, haystack);
+        matcher.find()
+    }
+
+    fn find_from_at<H: Haystack>(&self, haystack: H, start: usize) -> Option<Match> {
+        let matcher = Matcher::new(&self.ast, &self.flags, haystack);
+        matcher.find_at(start)
+    }
+
+    fn find_all_from<'a, H: Haystack + 'a>(
+        &'a self,
+        haystack: H,
+    ) -> Box<dyn Iterator<Item = Match> + 'a> {
+        Box::new(FindMatchesIterator {
+            text: haystack,
+            regex: self,
+            last_end: 0,
+        })
+    }
+}
+
+// Iterator implementations for backtracker
+struct FindMatchesIterator<'a, H: Haystack> {
+    text: H,
+    regex: &'a BacktrackingRegex,
+    last_end: usize,
+}
+
+impl<'a, H: Haystack> Iterator for FindMatchesIterator<'a, H> {
+    type Item = Match;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.last_end > self.text.len() {
+            return None;
+        }
+        let m = self.regex.find_from_at(self.text.clone(), self.last_end)?;
+        self.last_end = m.end.max(m.start + 1);
+        Some(m)
+    }
+}

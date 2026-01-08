@@ -12,7 +12,15 @@ impl PikeVM {
     }
 
     pub fn find_from<H: Haystack>(&self, text: H, start_index: usize) -> Option<Match> {
-        let mut matched: Option<Match> = None;
+        self.find_raw(text, start_index).map(|(m, _)| m)
+    }
+
+    pub fn find_raw<H: Haystack>(
+        &self,
+        text: H,
+        start_index: usize,
+    ) -> Option<(Match, Vec<Option<usize>>)> {
+        let mut matched: Option<(Match, Vec<Option<usize>>)> = None;
         let num_states = self.nfa.states.len();
         // current_states: maps state_id -> Captures
         // Captures is a Vec<Option<usize>> where indices correspond to capture group slots.
@@ -50,7 +58,7 @@ impl PikeVM {
                 // End is current pos.
 
                 let new_match = Match { start, end: pos };
-                let replace = if let Some(ref existing) = matched {
+                let replace = if let Some((ref existing, _)) = matched {
                     if new_match.start < existing.start {
                         true
                     } else if new_match.start == existing.start {
@@ -64,8 +72,7 @@ impl PikeVM {
                 };
 
                 if replace {
-                    matched = Some(new_match);
-                    // TODO: Return captures if API supports it.
+                    matched = Some((new_match, caps.clone()));
                 }
             }
 

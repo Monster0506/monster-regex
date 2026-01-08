@@ -30,3 +30,7 @@ mod flags;
 
 #[cfg(test)]
 mod streaming;
+
+#[cfg(test)]
+#[path = "linear_api.rs"]
+mod linear_api;
