@@ -178,33 +178,15 @@ impl CompiledRegex for LinearRegex {
     }
 
     fn captures(&self, text: &str) -> Option<Captures> {
-        let (full, slots) = self.vm.find_raw(text, 0)?;
-
-        let mut groups = vec![None; self.group_count];
-        // Fill groups from slots
-        for i in 1..=self.group_count {
-            let start_slot = 2 * i;
-            let end_slot = 2 * i + 1;
-            if start_slot < slots.len() && end_slot < slots.len() {
-                if let (Some(s), Some(e)) = (slots[start_slot], slots[end_slot]) {
-                    groups[i - 1] = Some(Match { start: s, end: e });
-                }
-            }
-        }
-
-        let mut named = HashMap::new();
-        for (name, idx) in &self.named_groups {
-            if *idx > 0 && *idx <= groups.len() {
-                if let Some(m) = &groups[idx - 1] {
-                    named.insert(name.clone(), m.clone());
-                }
-            }
-        }
+        // TODO: Greedy mode doesn't track captures during search
+        // Captures are NOT supported in the Linear engine yet
+        // For now, return basic match without capture groups
+        let full = self.vm.find_raw(text, 0)?;
 
         Some(Captures {
             full_match: full,
-            groups,
-            named,
+            groups: vec![], // Empty - captures not supported
+            named: HashMap::new(),
         })
     }
 

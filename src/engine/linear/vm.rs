@@ -1,11 +1,102 @@
 use super::nfa::{Nfa, State};
 use crate::captures::Match;
 use crate::haystack::Haystack;
-use std::rc::Rc;
+
+/// Active state with origin tracking
+/// This is the canonical PikeVM representation:
+/// each active state knows where it was spawned from
+#[derive(Clone, Copy)]
+struct ActiveState {
+    /// NFA state index (program counter)
+    pc: usize,
+    /// Position where this thread was spawned (match start)
+    origin: usize,
+}
+
+/// Thread list for PikeVM execution
+/// Stores active states with their origins
+struct ThreadList {
+    /// Active states with origins
+    states: Vec<ActiveState>,
+    /// Deduplication: true if state is currently active (1 byte per state!)
+    seen: Vec<bool>,
+}
+
+impl ThreadList {
+    fn new(capacity: usize) -> Self {
+        Self {
+            states: Vec::with_capacity(capacity),
+            seen: vec![false; capacity],
+        }
+    }
+
+    fn clear(&mut self) {
+        for state in &self.states {
+            self.seen[state.pc] = false;
+        }
+        self.states.clear();
+    }
+
+    fn contains(&self, pc: usize) -> bool {
+        self.seen[pc]
+    }
+
+    /// Insert state with origin. First insertion wins (earliest origin).
+    /// O(1) - simple boolean check
+    #[inline(always)]
+    fn insert(&mut self, pc: usize, origin: usize) {
+        if !self.seen[pc] {
+            self.seen[pc] = true;
+            self.states.push(ActiveState { pc, origin });
+        }
+        // If already seen, skip - first insertion wins (leftmost match)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+
+    /// Get origin for a state (only used for match checking, so O(n) is acceptable)
+    fn get_origin(&self, pc: usize) -> Option<usize> {
+        for state in &self.states {
+            if state.pc == pc {
+                return Some(state.origin);
+            }
+        }
+        None
+    }
+}
+
+/// Reusable context for PikeVM execution
+/// Allocated ONCE per PikeVM instance, reused across all find calls
+struct VMContext {
+    current: ThreadList,
+    next: ThreadList,
+    epsilon_stack: Vec<(usize, usize)>, // (pc, origin)
+}
+
+impl VMContext {
+    fn new(num_states: usize) -> Self {
+        Self {
+            current: ThreadList::new(num_states),
+            next: ThreadList::new(num_states),
+            epsilon_stack: Vec::with_capacity(num_states),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.current.clear();
+        self.next.clear();
+        self.epsilon_stack.clear();
+    }
+}
+
+use std::sync::Mutex;
 
 pub struct PikeVM {
     nfa: Nfa,
     start_byte: Option<u8>,
+    ctx: Mutex<VMContext>,
 }
 
 #[cfg(feature = "internal_metrics")]
@@ -18,18 +109,19 @@ pub struct Metrics {
 
 impl PikeVM {
     pub fn new(nfa: Nfa, start_byte: Option<u8>) -> Self {
-        Self { nfa, start_byte }
+        let num_states = nfa.states.len();
+        Self {
+            nfa,
+            start_byte,
+            ctx: Mutex::new(VMContext::new(num_states)),
+        }
     }
 
     pub fn find_from<H: Haystack>(&self, text: H, start_index: usize) -> Option<Match> {
-        self.find_raw(text, start_index).map(|(m, _)| m)
+        self.find_raw(text, start_index)
     }
 
-    pub fn find_raw<H: Haystack>(
-        &self,
-        text: H,
-        start_index: usize,
-    ) -> Option<(Match, Vec<Option<usize>>)> {
+    pub fn find_raw<H: Haystack>(&self, text: H, start_index: usize) -> Option<Match> {
         if self.start_byte.is_some() {
             self.find_raw_prefilter(text, start_index)
         } else {
@@ -37,408 +129,333 @@ impl PikeVM {
         }
     }
 
-    #[inline(always)]
-    fn find_raw_prefilter<H: Haystack>(
-        &self,
-        text: H,
-        start_index: usize,
-    ) -> Option<(Match, Vec<Option<usize>>)> {
-        let mut matched: Option<(Match, Rc<Vec<Option<usize>>>)> = None;
-        let num_states = self.nfa.states.len();
-        let mut current_states: Vec<Option<Rc<Vec<Option<usize>>>>> = vec![None; num_states];
-        let mut next_states: Vec<Option<Rc<Vec<Option<usize>>>>> = vec![None; num_states];
-        let mut active_ids = Vec::with_capacity(num_states);
-        let mut next_active_ids = Vec::with_capacity(num_states);
-        let len = text.len();
-
-        #[cfg(feature = "internal_metrics")]
-        let mut metrics = Metrics::default();
-
-        let mut pos = start_index;
-        let sb = self.start_byte.unwrap(); // helper called only if some
-
-        while pos <= len {
-            // Optimization: If no active states, jump using start_byte
-            if active_ids.is_empty() {
-                if pos < len {
-                    if let Some(next_pos) = text.find_byte(sb, pos) {
-                        if next_pos > pos {
-                            pos = next_pos;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            // Start seed logic: match start_byte
-            let can_start = pos < len && text.find_byte(sb, pos) == Some(pos);
-
-            if can_start {
-                let mut start_caps_vec = vec![None; 20];
-                start_caps_vec.resize(2, None);
-                start_caps_vec[0] = Some(pos);
-                let start_caps = Rc::new(start_caps_vec);
-
-                let spawn_allowed = matched.as_ref().map_or(true, |(m, _)| pos <= m.start);
-
-                if spawn_allowed {
-                    self.add_state(
-                        &mut current_states,
-                        &mut active_ids,
-                        self.nfa.start,
-                        start_caps,
-                        pos,
-                        &text,
-                        #[cfg(feature = "internal_metrics")]
-                        &mut metrics,
-                    );
-                }
-            }
-
-            // Check matches
-            if let Some(caps) = &current_states[self.nfa.match_state] {
-                let start = caps.first().copied().flatten().unwrap_or(pos);
-                let new_match = Match { start, end: pos };
-                let replace = if let Some((ref existing, _)) = matched {
-                    if new_match.start < existing.start {
-                        true
-                    } else if new_match.start == existing.start {
-                        new_match.end > existing.end
-                    } else {
-                        false
-                    }
-                } else {
-                    true
-                };
-                if replace {
-                    matched = Some((new_match, caps.clone()));
-                }
-            }
-
-            if pos == len {
-                break;
-            }
-
-            let (char_val, char_len) = match text.char_at(pos) {
-                Some(c) => c,
-                None => break,
-            };
-
-            // Step
-            next_states.fill(None);
-            next_active_ids.clear();
-            for &sid in &active_ids {
-                if let Some(caps) = &current_states[sid] {
-                    if let Some(next_sid) = self.get_next_state(sid, char_val) {
-                        self.add_state(
-                            &mut next_states,
-                            &mut next_active_ids,
-                            next_sid,
-                            caps.clone(),
-                            pos + char_len,
-                            &text,
-                            #[cfg(feature = "internal_metrics")]
-                            &mut metrics,
-                        );
-                        #[cfg(feature = "internal_metrics")]
-                        {
-                            metrics.clones += 1;
-                        }
-                    }
-                }
-            }
-
-            #[cfg(feature = "internal_metrics")]
-            {
-                metrics.steps += 1;
-                metrics.active_states += active_ids.len();
-            }
-
-            std::mem::swap(&mut current_states, &mut next_states);
-            std::mem::swap(&mut active_ids, &mut next_active_ids);
-
-            if matched.is_some() && active_ids.is_empty() {
-                break;
-            }
-
-            pos += char_len;
-        }
-
-        matched.map(|(m, caps)| (m, (*caps).clone()))
-    }
-
-    #[inline(always)]
-    fn find_raw_baseline<H: Haystack>(
-        &self,
-        text: H,
-        start_index: usize,
-    ) -> Option<(Match, Vec<Option<usize>>)> {
-        let mut matched: Option<(Match, Rc<Vec<Option<usize>>>)> = None;
-        let num_states = self.nfa.states.len();
-        let mut current_states: Vec<Option<Rc<Vec<Option<usize>>>>> = vec![None; num_states];
-        let mut next_states: Vec<Option<Rc<Vec<Option<usize>>>>> = vec![None; num_states];
-        let mut active_ids = Vec::with_capacity(num_states);
-        let mut next_active_ids = Vec::with_capacity(num_states);
-        let len = text.len();
-
-        #[cfg(feature = "internal_metrics")]
-        let mut metrics = Metrics::default();
-
-        let mut pos = start_index;
-        while pos <= len {
-            // Always try to spawn start seed
-            // Start state matches at `pos`.
-            let mut start_caps_vec = vec![None; 20];
-            start_caps_vec.resize(2, None);
-            start_caps_vec[0] = Some(pos);
-            let start_caps = Rc::new(start_caps_vec);
-
-            let spawn_allowed = matched.as_ref().map_or(true, |(m, _)| pos <= m.start);
-            if spawn_allowed {
-                self.add_state(
-                    &mut current_states,
-                    &mut active_ids,
-                    self.nfa.start,
-                    start_caps,
-                    pos,
-                    &text,
-                    #[cfg(feature = "internal_metrics")]
-                    &mut metrics,
-                );
-            }
-
-            // Check matches
-            if let Some(caps) = &current_states[self.nfa.match_state] {
-                let start = caps.first().copied().flatten().unwrap_or(pos);
-                let new_match = Match { start, end: pos };
-                let replace = if let Some((ref existing, _)) = matched {
-                    if new_match.start < existing.start {
-                        true
-                    } else if new_match.start == existing.start {
-                        new_match.end > existing.end
-                    } else {
-                        false
-                    }
-                } else {
-                    true
-                };
-                if replace {
-                    matched = Some((new_match, caps.clone()));
-                }
-            }
-
-            if pos == len {
-                break;
-            }
-
-            let (char_val, char_len) = match text.char_at(pos) {
-                Some(c) => c,
-                None => break,
-            };
-
-            // Step
-            next_states.fill(None);
-            next_active_ids.clear();
-            for &sid in &active_ids {
-                if let Some(caps) = &current_states[sid] {
-                    if let Some(next_sid) = self.get_next_state(sid, char_val) {
-                        self.add_state(
-                            &mut next_states,
-                            &mut next_active_ids,
-                            next_sid,
-                            caps.clone(),
-                            pos + char_len,
-                            &text,
-                            #[cfg(feature = "internal_metrics")]
-                            &mut metrics,
-                        );
-                        #[cfg(feature = "internal_metrics")]
-                        {
-                            metrics.clones += 1;
-                        }
-                    }
-                }
-            }
-
-            #[cfg(feature = "internal_metrics")]
-            {
-                metrics.steps += 1;
-                metrics.active_states += active_ids.len();
-            }
-
-            std::mem::swap(&mut current_states, &mut next_states);
-            std::mem::swap(&mut active_ids, &mut next_active_ids);
-
-            if matched.is_some() && active_ids.is_empty() {
-                break;
-            }
-
-            pos += char_len;
-        }
-
-        #[cfg(feature = "internal_metrics")]
-        eprintln!(
-            "PROFILE: len={} steps={} avg_states={:.2} total_clones={} nfa_size={}",
-            len,
-            metrics.steps,
-            metrics.active_states as f64 / metrics.steps.max(1) as f64,
-            metrics.clones,
-            self.nfa.states.len()
-        );
-
-        matched.map(|(m, caps)| (m, (*caps).clone()))
-    }
-
-    fn add_state<H: Haystack>(
-        &self,
-        states: &mut Vec<Option<Rc<Vec<Option<usize>>>>>,
-        active: &mut Vec<usize>,
-        sid: usize,
-        captures: Rc<Vec<Option<usize>>>,
-        current_pos: usize,
+    /// Add state to current set with epsilon closure (stack-based, zero allocation)
+    /// Takes individual field refs to allow split borrows
+    fn add_state_epsilon<H: Haystack>(
+        nfa: &Nfa,
+        current: &mut ThreadList,
+        epsilon_stack: &mut Vec<(usize, usize)>,
+        state_id: usize,
+        origin: usize,
+        pos: usize,
         text: &H,
-        #[cfg(feature = "internal_metrics")] metrics: &mut Metrics,
     ) {
-        if states[sid].is_some() {
-            return;
+        epsilon_stack.clear();
+        epsilon_stack.push((state_id, origin));
+
+        while let Some((sid, orig)) = epsilon_stack.pop() {
+            if current.contains(sid) {
+                // If already present, ThreadList.insert will keep earlier origin
+                current.insert(sid, orig);
+                continue;
+            }
+
+            current.insert(sid, orig);
+
+            // Follow epsilon transitions, propagating origin unchanged
+            match nfa.states[sid] {
+                State::Jump(next) => {
+                    epsilon_stack.push((next, orig));
+                }
+                State::Split(s1, s2) => {
+                    epsilon_stack.push((s1, orig));
+                    epsilon_stack.push((s2, orig));
+                }
+                State::Save(_, next) => {
+                    epsilon_stack.push((next, orig));
+                }
+                State::AnchorStart(next) => {
+                    if pos == 0 {
+                        epsilon_stack.push((next, orig));
+                    }
+                }
+                State::AnchorEnd(next) => {
+                    if pos == text.len() {
+                        epsilon_stack.push((next, orig));
+                    }
+                }
+                State::WordBoundary(next) => {
+                    if is_word_boundary(text, pos) {
+                        epsilon_stack.push((next, orig));
+                    }
+                }
+                State::WordStart(next) => {
+                    if is_word_start(text, pos) {
+                        epsilon_stack.push((next, orig));
+                    }
+                }
+                State::WordEnd(next) => {
+                    if is_word_end(text, pos) {
+                        epsilon_stack.push((next, orig));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn find_raw_prefilter<H: Haystack>(&self, text: H, start_index: usize) -> Option<Match> {
+        let mut guard = self.ctx.lock().unwrap();
+        let ctx = &mut *guard; // Dereference to allow split borrows
+        ctx.reset();
+
+        let len = text.len();
+        let sb = self.start_byte.unwrap();
+
+        let mut best_match: Option<Match> = None;
+        let mut pos = start_index;
+
+        while pos <= len {
+            // If no active states, jump to next start_byte
+            if ctx.current.is_empty() && pos < len {
+                if let Some(next_pos) = text.find_byte(sb, pos) {
+                    pos = next_pos;
+                } else {
+                    break;
+                }
+            }
+
+            // Try to start new match if we're at start_byte
+            let can_start = pos < len && text.find_byte(sb, pos) == Some(pos);
+            if can_start {
+                let spawn_allowed = best_match.as_ref().map_or(true, |m| pos <= m.start);
+                if spawn_allowed {
+                    // Spawn new thread with origin = current position
+                    Self::add_state_epsilon(
+                        &self.nfa,
+                        &mut ctx.current,
+                        &mut ctx.epsilon_stack,
+                        self.nfa.start,
+                        pos, // origin
+                        pos, // position for anchor checks
+                        &text,
+                    );
+                }
+            }
+
+            // Check for match - get origin from match state
+            if ctx.current.contains(self.nfa.match_state) {
+                if let Some(origin) = ctx.current.get_origin(self.nfa.match_state) {
+                    let new_match = Match {
+                        start: origin,
+                        end: pos,
+                    };
+
+                    let should_replace = match &best_match {
+                        None => true,
+                        Some(existing) => {
+                            if new_match.start < existing.start {
+                                true
+                            } else if new_match.start == existing.start {
+                                new_match.end > existing.end
+                            } else {
+                                false
+                            }
+                        }
+                    };
+
+                    if should_replace {
+                        best_match = Some(new_match);
+                    }
+                }
+            }
+
+            if pos == len {
+                break;
+            }
+
+            let (char_val, char_len) = match text.char_at(pos) {
+                Some(c) => c,
+                None => break,
+            };
+
+            // Step: transition current states to next states
+            ctx.next.clear();
+
+            // Iterate by index to avoid cloning - ZERO allocations
+            for i in 0..ctx.current.states.len() {
+                let state = ctx.current.states[i];
+                if let Some(next_id) = self.get_next_state(state.pc, char_val) {
+                    Self::add_state_to_next(
+                        &self.nfa,
+                        &mut ctx.next,
+                        &mut ctx.epsilon_stack,
+                        next_id,
+                        state.origin, // First-seen origin is correct
+                        pos + char_len,
+                        &text,
+                    );
+                }
+            }
+
+            // Swap
+            std::mem::swap(&mut ctx.current, &mut ctx.next);
+
+            if best_match.is_some() && ctx.current.is_empty() {
+                break;
+            }
+
+            pos += char_len;
         }
 
-        states[sid] = Some(captures.clone());
+        best_match
+    }
 
-        active.push(sid);
+    /// Add state to NEXT set with epsilon closure (for character transitions)
+    fn add_state_to_next<H: Haystack>(
+        nfa: &Nfa,
+        next: &mut ThreadList,
+        stack: &mut Vec<(usize, usize)>,
+        state_id: usize,
+        origin: usize,
+        pos: usize,
+        text: &H,
+    ) {
+        stack.clear();
+        stack.push((state_id, origin));
 
-        // Epsilon closure
-        match &self.nfa.states[sid] {
-            State::Jump(next) => self.add_state(
-                states,
-                active,
-                *next,
-                captures,
-                current_pos,
-                text,
-                #[cfg(feature = "internal_metrics")]
-                metrics,
-            ),
-            State::Split(s1, s2) => {
-                self.add_state(
-                    states,
-                    active,
-                    *s1,
-                    captures.clone(),
-                    current_pos,
-                    text,
-                    #[cfg(feature = "internal_metrics")]
-                    metrics,
-                );
-                #[cfg(feature = "internal_metrics")]
-                {
-                    metrics.clones += 1; // Count RC clone as clone
-                }
-                self.add_state(
-                    states,
-                    active,
-                    *s2,
-                    captures,
-                    current_pos,
-                    text,
-                    #[cfg(feature = "internal_metrics")]
-                    metrics,
-                );
+        while let Some((sid, orig)) = stack.pop() {
+            if next.contains(sid) {
+                // Update origin if new one is earlier
+                next.insert(sid, orig);
+                continue;
             }
-            State::Save(slot, next) => {
-                // COW: Make mutable. If strictly owned, no clone. If shared, clones vec.
-                let mut caps = captures;
-                let inner = Rc::make_mut(&mut caps);
 
-                if *slot >= inner.len() {
-                    inner.resize(*slot + 1, None);
-                }
-                inner[*slot] = Some(current_pos);
+            next.insert(sid, orig);
 
-                self.add_state(
-                    states,
-                    active,
-                    *next,
-                    caps,
-                    current_pos,
-                    text,
-                    #[cfg(feature = "internal_metrics")]
-                    metrics,
-                );
-            }
-            State::AnchorStart(next) => {
-                if current_pos == 0 {
-                    self.add_state(
-                        states,
-                        active,
-                        *next,
-                        captures,
-                        current_pos,
-                        text,
-                        #[cfg(feature = "internal_metrics")]
-                        metrics,
-                    );
+            match nfa.states[sid] {
+                State::Jump(nxt) => {
+                    stack.push((nxt, orig));
                 }
-            }
-            State::AnchorEnd(next) => {
-                if current_pos == text.len() {
-                    self.add_state(
-                        states,
-                        active,
-                        *next,
-                        captures,
-                        current_pos,
-                        text,
-                        #[cfg(feature = "internal_metrics")]
-                        metrics,
-                    );
+                State::Split(s1, s2) => {
+                    stack.push((s1, orig));
+                    stack.push((s2, orig));
                 }
-            }
-            State::WordBoundary(next) => {
-                if is_word_boundary(text, current_pos) {
-                    self.add_state(
-                        states,
-                        active,
-                        *next,
-                        captures,
-                        current_pos,
-                        text,
-                        #[cfg(feature = "internal_metrics")]
-                        metrics,
-                    );
+                State::Save(_, nxt) => {
+                    stack.push((nxt, orig));
                 }
-            }
-            State::WordStart(next) => {
-                if is_word_start(text, current_pos) {
-                    self.add_state(
-                        states,
-                        active,
-                        *next,
-                        captures,
-                        current_pos,
-                        text,
-                        #[cfg(feature = "internal_metrics")]
-                        metrics,
-                    );
+                State::AnchorStart(nxt) => {
+                    if pos == 0 {
+                        stack.push((nxt, orig));
+                    }
                 }
-            }
-            State::WordEnd(next) => {
-                if is_word_end(text, current_pos) {
-                    self.add_state(
-                        states,
-                        active,
-                        *next,
-                        captures,
-                        current_pos,
-                        text,
-                        #[cfg(feature = "internal_metrics")]
-                        metrics,
-                    );
+                State::AnchorEnd(nxt) => {
+                    if pos == text.len() {
+                        stack.push((nxt, orig));
+                    }
                 }
+                State::WordBoundary(nxt) => {
+                    if is_word_boundary(text, pos) {
+                        stack.push((nxt, orig));
+                    }
+                }
+                State::WordStart(nxt) => {
+                    if is_word_start(text, pos) {
+                        stack.push((nxt, orig));
+                    }
+                }
+                State::WordEnd(nxt) => {
+                    if is_word_end(text, pos) {
+                        stack.push((nxt, orig));
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
+    }
+
+    #[inline(always)]
+    fn find_raw_baseline<H: Haystack>(&self, text: H, start_index: usize) -> Option<Match> {
+        let mut guard = self.ctx.lock().unwrap();
+        let ctx = &mut *guard; // Dereference to allow split borrows
+        ctx.reset();
+
+        let len = text.len();
+
+        let mut best_match: Option<Match> = None;
+        let mut pos = start_index;
+
+        while pos <= len {
+            // Spawn a new thread at this position if allowed
+            let spawn_allowed = best_match.as_ref().map_or(true, |m| pos <= m.start);
+            if spawn_allowed {
+                Self::add_state_epsilon(
+                    &self.nfa,
+                    &mut ctx.current,
+                    &mut ctx.epsilon_stack,
+                    self.nfa.start,
+                    pos, // origin
+                    pos, // position for anchor checks
+                    &text,
+                );
+            }
+
+            // Check for match - get origin from match state
+            if ctx.current.contains(self.nfa.match_state) {
+                if let Some(origin) = ctx.current.get_origin(self.nfa.match_state) {
+                    let new_match = Match {
+                        start: origin,
+                        end: pos,
+                    };
+
+                    let should_replace = match &best_match {
+                        None => true,
+                        Some(existing) => {
+                            if new_match.start < existing.start {
+                                true
+                            } else if new_match.start == existing.start {
+                                new_match.end > existing.end
+                            } else {
+                                false
+                            }
+                        }
+                    };
+
+                    if should_replace {
+                        best_match = Some(new_match);
+                    }
+                }
+            }
+
+            if pos == len {
+                break;
+            }
+
+            let (char_val, char_len) = match text.char_at(pos) {
+                Some(c) => c,
+                None => break,
+            };
+
+            // Step: transition current states to next states
+            ctx.next.clear();
+
+            // Iterate by index to avoid cloning - ZERO allocations
+            for i in 0..ctx.current.states.len() {
+                let state = ctx.current.states[i];
+                if let Some(next_id) = self.get_next_state(state.pc, char_val) {
+                    Self::add_state_to_next(
+                        &self.nfa,
+                        &mut ctx.next,
+                        &mut ctx.epsilon_stack,
+                        next_id,
+                        state.origin, // First-seen origin is correct
+                        pos + char_len,
+                        &text,
+                    );
+                }
+            }
+
+            std::mem::swap(&mut ctx.current, &mut ctx.next);
+
+            if best_match.is_some() && ctx.current.is_empty() {
+                break;
+            }
+
+            pos += char_len;
+        }
+
+        best_match
     }
 
     fn get_next_state(&self, sid: usize, c: char) -> Option<usize> {

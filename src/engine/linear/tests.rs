@@ -48,12 +48,9 @@ mod tests {
     #[test]
     fn test_quantifiers() {
         assert_eq!(compile_and_run("a*", "aaa"), Some((0, 3)));
-        assert_eq!(compile_and_run("a*", "b"), Some((0, 0))); // Matches empty at start
+        assert_eq!(compile_and_run("a*", "b"), Some((0, 0)));
         assert_eq!(compile_and_run("a+", "aaa"), Some((0, 3)));
-        assert_eq!(compile_and_run("a+", "b"), None); // find_from(0) fails if no match found anywhere? 
-        // My VM implementation currently adds start state at every position.
-        // So it should find NO match if 'a+' is not in 'b'.
-        // Wait, 'a*' in 'b' -> matches empty string at 0.
+        assert_eq!(compile_and_run("a+", "b"), None);
 
         // ?
         assert_eq!(compile_and_run("a?", "a"), Some((0, 1)));
