@@ -46,7 +46,7 @@ impl<'a> HaystackCursor for ChunkedCursor<'a> {
 impl<'a> Haystack for ChunkedHaystack<'a> {
     type Cursor = ChunkedCursor<'a>;
 
-    fn cursor_at(&self, mut pos: usize) -> Self::Cursor {
+    fn cursor_at(&self, pos: usize) -> Self::Cursor {
         let mut current_offset = 0;
         for (i, chunk) in self.chunks.iter().enumerate() {
             let chunk_len = chunk.len();

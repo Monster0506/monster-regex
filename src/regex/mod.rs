@@ -1,5 +1,5 @@
 use crate::captures::{Captures, Match};
-use crate::engine::Matcher;
+use crate::engine::backtracking::Matcher;
 use crate::errors::CompileError;
 use crate::flags::Flags;
 use crate::haystack::Haystack;
