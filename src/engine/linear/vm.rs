@@ -28,7 +28,6 @@ impl PikeVM {
         let mut current_states: Vec<Option<Vec<Option<usize>>>> = vec![None; num_states];
         let mut next_states: Vec<Option<Vec<Option<usize>>>> = vec![None; num_states];
 
-        // Active list to avoid iterating all `num_states`
         let mut active_ids = Vec::with_capacity(num_states);
         let mut next_active_ids = Vec::with_capacity(num_states);
 
@@ -42,14 +41,18 @@ impl PikeVM {
             start_caps.resize(2, None); // At least 0 and 1.
             start_caps[0] = Some(pos);
 
-            self.add_state(
-                &mut current_states,
-                &mut active_ids,
-                self.nfa.start,
-                start_caps,
-                pos,
-                &text,
-            );
+            let spawn_allowed = matched.as_ref().map_or(true, |(m, _)| pos <= m.start);
+
+            if spawn_allowed {
+                self.add_state(
+                    &mut current_states,
+                    &mut active_ids,
+                    self.nfa.start,
+                    start_caps,
+                    pos,
+                    &text,
+                );
+            }
 
             // Check matches in current_states
             if let Some(caps) = &current_states[self.nfa.match_state] {
