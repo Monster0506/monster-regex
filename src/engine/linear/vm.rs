@@ -6,6 +6,14 @@ pub struct PikeVM {
     nfa: Nfa,
 }
 
+#[cfg(feature = "internal_metrics")]
+#[derive(Debug, Default)]
+pub struct Metrics {
+    pub steps: usize,
+    pub active_states: usize,
+    pub clones: usize,
+}
+
 impl PikeVM {
     pub fn new(nfa: Nfa) -> Self {
         Self { nfa }
@@ -33,6 +41,9 @@ impl PikeVM {
 
         let len = text.len();
 
+        #[cfg(feature = "internal_metrics")]
+        let mut metrics = Metrics::default();
+
         for pos in start_index..=len {
             // Add start seed
             // Start state matches at `pos`.
@@ -51,6 +62,8 @@ impl PikeVM {
                     start_caps,
                     pos,
                     &text,
+                    #[cfg(feature = "internal_metrics")]
+                    &mut metrics,
                 );
             }
 
@@ -103,9 +116,22 @@ impl PikeVM {
                             caps.clone(),
                             pos + char_len,
                             &text,
+                            #[cfg(feature = "internal_metrics")]
+                            &mut metrics,
                         );
+                        #[cfg(feature = "internal_metrics")]
+                        {
+                            metrics.clones += 1;
+                        }
                     }
                 }
+            }
+
+            // Stats
+            #[cfg(feature = "internal_metrics")]
+            {
+                metrics.steps += 1;
+                metrics.active_states += active_ids.len();
             }
 
             // Swap
@@ -119,6 +145,16 @@ impl PikeVM {
             }
         }
 
+        #[cfg(feature = "internal_metrics")]
+        eprintln!(
+            "PROFILE: len={} steps={} avg_states={:.2} total_clones={} nfa_size={}",
+            len,
+            metrics.steps,
+            metrics.active_states as f64 / metrics.steps.max(1) as f64,
+            metrics.clones,
+            self.nfa.states.len()
+        );
+
         matched
     }
 
@@ -130,6 +166,7 @@ impl PikeVM {
         mut captures: Vec<Option<usize>>,
         current_pos: usize,
         text: &H,
+        #[cfg(feature = "internal_metrics")] metrics: &mut Metrics,
     ) {
         if states[sid].is_some() {
             return;
@@ -141,41 +178,126 @@ impl PikeVM {
 
         // Epsilon closure
         match &self.nfa.states[sid] {
-            State::Jump(next) => self.add_state(states, active, *next, captures, current_pos, text),
+            State::Jump(next) => self.add_state(
+                states,
+                active,
+                *next,
+                captures,
+                current_pos,
+                text,
+                #[cfg(feature = "internal_metrics")]
+                metrics,
+            ),
             State::Split(s1, s2) => {
-                self.add_state(states, active, *s1, captures.clone(), current_pos, text);
-                self.add_state(states, active, *s2, captures, current_pos, text);
+                self.add_state(
+                    states,
+                    active,
+                    *s1,
+                    captures.clone(),
+                    current_pos,
+                    text,
+                    #[cfg(feature = "internal_metrics")]
+                    metrics,
+                );
+                #[cfg(feature = "internal_metrics")]
+                {
+                    metrics.clones += 1;
+                }
+                self.add_state(
+                    states,
+                    active,
+                    *s2,
+                    captures,
+                    current_pos,
+                    text,
+                    #[cfg(feature = "internal_metrics")]
+                    metrics,
+                );
             }
             State::Save(slot, next) => {
                 if *slot >= captures.len() {
                     captures.resize(*slot + 1, None);
                 }
                 captures[*slot] = Some(current_pos);
-                self.add_state(states, active, *next, captures, current_pos, text);
+                self.add_state(
+                    states,
+                    active,
+                    *next,
+                    captures,
+                    current_pos,
+                    text,
+                    #[cfg(feature = "internal_metrics")]
+                    metrics,
+                );
             }
             State::AnchorStart(next) => {
                 if current_pos == 0 {
-                    self.add_state(states, active, *next, captures, current_pos, text);
+                    self.add_state(
+                        states,
+                        active,
+                        *next,
+                        captures,
+                        current_pos,
+                        text,
+                        #[cfg(feature = "internal_metrics")]
+                        metrics,
+                    );
                 }
             }
             State::AnchorEnd(next) => {
                 if current_pos == text.len() {
-                    self.add_state(states, active, *next, captures, current_pos, text);
+                    self.add_state(
+                        states,
+                        active,
+                        *next,
+                        captures,
+                        current_pos,
+                        text,
+                        #[cfg(feature = "internal_metrics")]
+                        metrics,
+                    );
                 }
             }
             State::WordBoundary(next) => {
                 if is_word_boundary(text, current_pos) {
-                    self.add_state(states, active, *next, captures, current_pos, text);
+                    self.add_state(
+                        states,
+                        active,
+                        *next,
+                        captures,
+                        current_pos,
+                        text,
+                        #[cfg(feature = "internal_metrics")]
+                        metrics,
+                    );
                 }
             }
             State::WordStart(next) => {
                 if is_word_start(text, current_pos) {
-                    self.add_state(states, active, *next, captures, current_pos, text);
+                    self.add_state(
+                        states,
+                        active,
+                        *next,
+                        captures,
+                        current_pos,
+                        text,
+                        #[cfg(feature = "internal_metrics")]
+                        metrics,
+                    );
                 }
             }
             State::WordEnd(next) => {
                 if is_word_end(text, current_pos) {
-                    self.add_state(states, active, *next, captures, current_pos, text);
+                    self.add_state(
+                        states,
+                        active,
+                        *next,
+                        captures,
+                        current_pos,
+                        text,
+                        #[cfg(feature = "internal_metrics")]
+                        metrics,
+                    );
                 }
             }
             _ => {}

@@ -9,6 +9,10 @@ documentation = "https://docs.rs/monster-regex"
 
 [dependencies]
 
+[features]
+default = []
+internal_metrics = []
+
 [dev-dependencies]
 criterion = "0.5"
 
