@@ -1,4 +1,4 @@
-use crate::haystack::Haystack;
+use crate::haystack::{Haystack, HaystackCursor};
 use crate::regex::Regex;
 
 #[derive(Clone, Copy, Debug)]
@@ -12,7 +12,62 @@ impl<'a> ChunkedHaystack<'a> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ChunkedCursor<'a> {
+    chunks: &'a [&'a str],
+    current_chunk: usize,
+    chars: std::str::Chars<'a>,
+}
+
+impl<'a> Iterator for ChunkedCursor<'a> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(c) = self.chars.next() {
+                return Some(c);
+            }
+            self.current_chunk += 1;
+            if self.current_chunk >= self.chunks.len() {
+                return None;
+            }
+            self.chars = self.chunks[self.current_chunk].chars();
+        }
+    }
+}
+
+impl<'a> HaystackCursor for ChunkedCursor<'a> {
+    fn peek(&self) -> Option<char> {
+        let mut clone = self.clone();
+        clone.next()
+    }
+}
+
 impl<'a> Haystack for ChunkedHaystack<'a> {
+    type Cursor = ChunkedCursor<'a>;
+
+    fn cursor_at(&self, mut pos: usize) -> Self::Cursor {
+        let mut current_offset = 0;
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            let chunk_len = chunk.len();
+            if pos < current_offset + chunk_len {
+                let local = pos - current_offset;
+                return ChunkedCursor {
+                    chunks: self.chunks,
+                    current_chunk: i,
+                    chars: chunk[local..].chars(),
+                };
+            }
+            current_offset += chunk_len;
+        }
+        // If pos is out of bounds (or at very end)
+        ChunkedCursor {
+            chunks: self.chunks,
+            current_chunk: self.chunks.len(),
+            chars: "".chars(),
+        }
+    }
+
     fn len(&self) -> usize {
         self.chunks.iter().map(|s| s.len()).sum()
     }

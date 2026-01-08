@@ -552,8 +552,8 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 };
 
                 // Prevent infinite loops on zero-width matches
-                if next_pos > pos {
-                    if let Some(final_pos) = self.match_quantifier_optional(
+                if next_pos > pos
+                    && let Some(final_pos) = self.match_quantifier_optional(
                         node,
                         max_remaining.map(|m| m - 1),
                         greedy,
@@ -562,11 +562,11 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                         &mut fork_ctx,
                         &mut fork_cursor,
                         next_prev_char,
-                    ) {
-                        *ctx = fork_ctx;
-                        *cursor = fork_cursor;
-                        return Some(final_pos);
-                    }
+                    )
+                {
+                    *ctx = fork_ctx;
+                    *cursor = fork_cursor;
+                    return Some(final_pos);
                 }
             }
 
@@ -587,20 +587,19 @@ impl<'a, H: Haystack> Matcher<'a, H> {
             // If that fails, try matching one more
             if let Some(next_pos) =
                 self.match_nodes(std::slice::from_ref(node), pos, ctx, cursor, prev_char)
+                && next_pos > pos
             {
-                if next_pos > pos {
-                    let next_prev_char = self.text.char_before(next_pos);
-                    return self.match_quantifier_optional(
-                        node,
-                        max_remaining.map(|m| m - 1),
-                        greedy,
-                        remaining,
-                        next_pos,
-                        ctx,
-                        cursor,
-                        next_prev_char,
-                    );
-                }
+                let next_prev_char = self.text.char_before(next_pos);
+                return self.match_quantifier_optional(
+                    node,
+                    max_remaining.map(|m| m - 1),
+                    greedy,
+                    remaining,
+                    next_pos,
+                    ctx,
+                    cursor,
+                    next_prev_char,
+                );
             }
             None
         }
