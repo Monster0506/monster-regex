@@ -44,7 +44,7 @@ impl PikeVM {
             );
 
             // Check matches in current_states
-            if let Some(caps) = &current_states[self.get_match_state_index()] {
+            if let Some(caps) = &current_states[self.nfa.match_state] {
                 // Determine start from caps[0]
                 let start = caps.get(0).copied().flatten().unwrap_or(pos); // Default?
                 // End is current pos.
@@ -126,9 +126,8 @@ impl PikeVM {
         }
 
         states[sid] = Some(captures.clone());
-        if !active.contains(&sid) {
-            active.push(sid);
-        }
+
+        active.push(sid);
 
         // Epsilon closure
         match &self.nfa.states[sid] {
@@ -223,14 +222,5 @@ impl PikeVM {
             }
             _ => false,
         }
-    }
-
-    fn get_match_state_index(&self) -> usize {
-        for (i, s) in self.nfa.states.iter().enumerate() {
-            if matches!(s, State::Match) {
-                return i;
-            }
-        }
-        0 // Should not happen
     }
 }

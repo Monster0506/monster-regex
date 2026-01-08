@@ -21,6 +21,7 @@ impl Compiler {
         self.nfa.start = start;
 
         let match_state = self.nfa.add_state(State::Match);
+        self.nfa.match_state = match_state;
         self.patch(outs, match_state);
 
         Ok(self.nfa)

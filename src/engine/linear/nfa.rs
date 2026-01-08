@@ -32,6 +32,7 @@ pub enum State {
 pub struct Nfa {
     pub states: Vec<State>,
     pub start: usize,
+    pub match_state: usize,
 }
 
 impl Nfa {
@@ -39,6 +40,7 @@ impl Nfa {
         Self {
             states: Vec::new(),
             start: 0,
+            match_state: 0,
         }
     }
 
