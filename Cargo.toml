@@ -8,3 +8,10 @@ repository = "https://github.com/monster0506/monster-regex"
 documentation = "https://docs.rs/monster-regex"
 
 [dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "main"
+harness = false
