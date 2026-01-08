@@ -30,7 +30,7 @@ fn generate_dna(len: usize) -> String {
 
 fn bench_engines(c: &mut Criterion) {
     let mut group = c.benchmark_group("Engine Comparison");
-    group.sample_size(10);
+    group.sample_size(20);
 
     let pattern_stress = r"fn.*\n.*return";
 
@@ -63,7 +63,7 @@ fn bench_engines(c: &mut Criterion) {
 
 fn bench_literals(c: &mut Criterion) {
     let mut group = c.benchmark_group("Literals");
-    group.sample_size(10);
+    group.sample_size(20);
     let input = generate_large_rust_code(500); // 100KB
     group.throughput(Throughput::Bytes(input.len() as u64));
 
@@ -89,7 +89,7 @@ fn bench_literals(c: &mut Criterion) {
 
 fn bench_common_syntax(c: &mut Criterion) {
     let mut group = c.benchmark_group("Common Syntax");
-    group.sample_size(10);
+    group.sample_size(20);
     let input = "Date: 2024-01-01, IP: 192.168.0.1, Email: test@example.com\n".repeat(1000);
     group.throughput(Throughput::Bytes(input.len() as u64));
 
@@ -120,7 +120,7 @@ fn bench_common_syntax(c: &mut Criterion) {
 
 fn bench_dna(c: &mut Criterion) {
     let mut group = c.benchmark_group("DNA");
-    group.sample_size(10);
+    group.sample_size(20);
     let input = generate_dna(10_000);
     group.throughput(Throughput::Bytes(input.len() as u64));
 
@@ -151,7 +151,7 @@ fn bench_dna(c: &mut Criterion) {
 
 fn bench_pathological(c: &mut Criterion) {
     let mut group = c.benchmark_group("Pathological Cases");
-    group.sample_size(10);
+    group.sample_size(20);
 
     // Pattern: (a+)+$
     // This is the classic catastrophic backtracking case.

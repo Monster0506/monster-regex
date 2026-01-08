@@ -97,9 +97,12 @@ impl LinearRegex {
         // Extract capture group names and count
         let (group_count, named_groups) = analyze_captures(&ast);
 
+        // Analyze start byte for properties optimization
+        let start_byte = analyze_start_byte(&ast, &flags);
+
         let compiler = Compiler::new(flags);
         let nfa = compiler.compile(&ast)?;
-        let vm = PikeVM::new(nfa);
+        let vm = PikeVM::new(nfa, start_byte);
 
         Ok(LinearRegex {
             vm,
@@ -109,6 +112,44 @@ impl LinearRegex {
             named_groups,
         })
     }
+}
+
+fn analyze_start_byte(nodes: &[AstNode], flags: &Flags) -> Option<u8> {
+    if nodes.is_empty() {
+        return None;
+    }
+
+    let ic = flags.ignore_case.unwrap_or(false);
+
+    match &nodes[0] {
+        AstNode::Literal(c) => {
+            if ic && c.to_lowercase().next() != c.to_uppercase().next() {
+                return None;
+            }
+            if c.is_ascii() {
+                return Some(*c as u8);
+            }
+        }
+        AstNode::Exact { node, .. } | AstNode::OneOrMore { node, .. } => {
+            if let AstNode::Literal(c) = &**node {
+                if ic && c.to_lowercase().next() != c.to_uppercase().next() {
+                    return None;
+                }
+                if c.is_ascii() {
+                    return Some(*c as u8);
+                }
+            }
+            // Recursively analyze group if wrapped
+            if let AstNode::Group { nodes, .. } = &**node {
+                return analyze_start_byte(nodes, flags);
+            }
+        }
+        AstNode::Group { nodes, .. } => {
+            return analyze_start_byte(nodes, flags);
+        }
+        _ => {}
+    }
+    None
 }
 
 impl CompiledRegex for LinearRegex {

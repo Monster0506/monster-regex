@@ -146,6 +146,36 @@ impl<'a> Haystack for ChunkedHaystack<'a> {
         }
         true
     }
+
+    fn find_byte(&self, byte: u8, pos: usize) -> Option<usize> {
+        let mut p = pos;
+        while p < self.len() {
+            let mut current_offset = 0;
+            let mut found_chunk = false;
+            for chunk in self.chunks {
+                let chunk_len = chunk.len();
+                if p < current_offset + chunk_len {
+                    let local_pos = p - current_offset;
+                    // We are in this chunk
+                    if let Some(i) = chunk.as_bytes()[local_pos..]
+                        .iter()
+                        .position(|&b| b == byte)
+                    {
+                        return Some(current_offset + local_pos + i);
+                    }
+                    // Not found in this chunk, move to next
+                    p = current_offset + chunk_len;
+                    found_chunk = true;
+                    break;
+                }
+                current_offset += chunk_len;
+            }
+            if !found_chunk && p >= self.len() {
+                break;
+            }
+        }
+        None
+    }
 }
 
 #[test]

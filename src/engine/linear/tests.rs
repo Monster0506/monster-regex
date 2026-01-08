@@ -14,7 +14,7 @@ mod tests {
         let compiler = Compiler::new(flags);
         let nfa = compiler.compile(&ast).expect("Compile failed");
 
-        let vm = PikeVM::new(nfa);
+        let vm = PikeVM::new(nfa, None);
         let m = vm.find_from(text, 0)?;
         Some((m.start, m.end))
     }
@@ -26,7 +26,7 @@ mod tests {
         let compiler = Compiler::new(flags);
         let nfa = compiler.compile(&ast).expect("Compile failed");
 
-        let vm = PikeVM::new(nfa);
+        let vm = PikeVM::new(nfa, None);
         let m = vm.find_from(text, 0)?;
         Some((m.start, m.end))
     }
@@ -175,6 +175,26 @@ mod tests {
         fn matches_range(&self, _pos: usize, _other_start: usize, _other_end: usize) -> bool {
             unimplemented!("Not needed for linear engine basic tests")
         }
+
+        fn find_byte(&self, byte: u8, pos: usize) -> Option<usize> {
+            if pos < self.first.len() {
+                if let Some(i) = self.first[pos..].bytes().position(|b| b == byte) {
+                    return Some(pos + i);
+                }
+                // Not found in first, try second from start
+                if let Some(i) = self.second.bytes().position(|b| b == byte) {
+                    return Some(self.first.len() + i);
+                }
+            } else {
+                let offset = pos - self.first.len();
+                if offset < self.second.len() {
+                    if let Some(i) = self.second[offset..].bytes().position(|b| b == byte) {
+                        return Some(pos + i);
+                    }
+                }
+            }
+            None
+        }
     }
 
     #[test]
@@ -189,7 +209,7 @@ mod tests {
         let compiler = Compiler::new(flags);
         let nfa = compiler.compile(&ast).expect("Compile failed");
 
-        let vm = PikeVM::new(nfa);
+        let vm = PikeVM::new(nfa, None);
         let m = vm.find_from(haystack, 0).expect("Match not found");
 
         // b at index 1, c at 2, d at 3 (start of second chunk)

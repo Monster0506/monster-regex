@@ -25,6 +25,10 @@ pub trait Haystack: Copy + Clone {
 
     /// Check if range matches another range
     fn matches_range(&self, pos: usize, other_start: usize, other_end: usize) -> bool;
+
+    /// Find the first occurrence of a byte starting at `pos`.
+    /// Returns `None` if not found.
+    fn find_byte(&self, byte: u8, pos: usize) -> Option<usize>;
 }
 
 pub trait HaystackCursor: Iterator<Item = char> + Clone {
@@ -79,6 +83,14 @@ impl<'a> Haystack for &'a str {
         StrCursor {
             chars: self[pos..].chars(),
         }
+    }
+
+    #[inline]
+    fn find_byte(&self, byte: u8, pos: usize) -> Option<usize> {
+        if pos >= self.len() {
+            return None;
+        }
+        memchr::memchr(byte, self[pos..].as_bytes()).map(|i| i + pos)
     }
 }
 

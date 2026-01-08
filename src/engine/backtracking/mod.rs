@@ -9,6 +9,7 @@ pub struct Matcher<'a, H: Haystack> {
     nodes: &'a [AstNode],
     flags: &'a Flags,
     text: H,
+    start_byte: Option<u8>,
 }
 
 struct QuantifierParams {
@@ -42,8 +43,13 @@ impl MatchContext {
 
 impl<'a, H: Haystack> Matcher<'a, H> {
     /// Creates a new Matcher instance.
-    pub fn new(nodes: &'a [AstNode], flags: &'a Flags, text: H) -> Self {
-        Self { nodes, flags, text }
+    pub fn new(nodes: &'a [AstNode], flags: &'a Flags, text: H, start_byte: Option<u8>) -> Self {
+        Self {
+            nodes,
+            flags,
+            text,
+            start_byte,
+        }
     }
 
     /// Finds the first match in the text.
@@ -55,48 +61,89 @@ impl<'a, H: Haystack> Matcher<'a, H> {
     pub fn find_at(&self, start_index: usize) -> Option<Match> {
         // Determine max group index for context sizing
         let max_group = self.count_groups(self.nodes);
-
-        // Try to match starting at every character boundary
-        let mut pos = start_index;
         let len = self.text.len();
-
-        let mut cursor = self.text.cursor_at(pos);
-        let mut prev_char = if pos > 0 {
-            self.text.char_before(pos)
-        } else {
-            None
-        };
 
         let mut context = MatchContext::new(max_group);
 
-        while pos <= len {
-            // Reset context for this attempt
-            context.clear();
+        if let Some(sb) = self.start_byte {
+            // OPTIMIZED PATH: Scan using memchr, then try match
+            let mut pos = start_index;
+            while pos < len {
+                if let Some(next_pos) = self.text.find_byte(sb, pos) {
+                    pos = next_pos; // Jump to candidate
 
-            // We need a clone of cursor for this attempt
-            let mut match_cursor = cursor.clone();
+                    let mut cursor = self.text.cursor_at(pos);
+                    // Optimization: We know we are at a byte match.
+                    // We need prev_char.
+                    // If pos > start_index ... actually just use char_before.
+                    let prev_char = if pos > 0 {
+                        self.text.char_before(pos)
+                    } else {
+                        None
+                    };
 
-            if let Some(end_pos) =
-                self.match_nodes(self.nodes, pos, &mut context, &mut match_cursor, prev_char)
-            {
-                let start = context.match_start_override.unwrap_or(pos);
-                let end = context.match_end_override.unwrap_or(end_pos);
-                return Some(Match { start, end });
-            }
+                    context.clear();
+                    let mut match_cursor = cursor.clone();
 
-            // Advance to next char
-            if pos < len {
-                if let Some(c) = cursor.next() {
-                    prev_char = Some(c);
-                    pos += c.len_utf8();
+                    if let Some(end_pos) = self.match_nodes(
+                        self.nodes,
+                        pos,
+                        &mut context,
+                        &mut match_cursor,
+                        prev_char,
+                    ) {
+                        let start = context.match_start_override.unwrap_or(pos);
+                        let end = context.match_end_override.unwrap_or(end_pos);
+                        return Some(Match { start, end });
+                    }
+
+                    // No match, advance past this byte
+                    if let Some(c) = cursor.next() {
+                        pos += c.len_utf8();
+                    } else {
+                        break; // Should not happen if pos < len
+                    }
                 } else {
-                    pos += 1; // Should not happen
+                    return None; // Start byte not found in remainder
                 }
+            }
+        } else {
+            // NAIVE PATH: Check every character boundary (Baseline performance)
+            let mut pos = start_index;
+
+            let mut cursor = self.text.cursor_at(pos);
+            let mut prev_char = if pos > 0 {
+                self.text.char_before(pos)
             } else {
-                break;
+                None
+            };
+
+            while pos <= len {
+                context.clear();
+
+                let mut match_cursor = cursor.clone();
+
+                if let Some(end_pos) =
+                    self.match_nodes(self.nodes, pos, &mut context, &mut match_cursor, prev_char)
+                {
+                    let start = context.match_start_override.unwrap_or(pos);
+                    let end = context.match_end_override.unwrap_or(end_pos);
+                    return Some(Match { start, end });
+                }
+
+                // Advance to next char
+                if pos < len {
+                    if let Some(c) = cursor.next() {
+                        prev_char = Some(c);
+                        pos += c.len_utf8();
+                    } else {
+                        pos += 1; // Should not happen
+                    }
+                } else {
+                    break;
+                }
             }
         }
-
         None
     }
 
@@ -713,6 +760,7 @@ pub struct BacktrackingRegex {
     ast: Vec<AstNode>,
     flags: Flags,
     pattern: String,
+    start_byte: Option<u8>,
 }
 
 impl BacktrackingRegex {
@@ -729,11 +777,57 @@ impl BacktrackingRegex {
             .parse()
             .map_err(|e| CompileError::InvalidPattern(e.to_string()))?;
 
+        let start_byte = Self::analyze_start_byte(&ast, &flags);
+
         Ok(BacktrackingRegex {
             ast,
             flags,
             pattern: pattern.to_string(),
+            start_byte,
         })
+    }
+
+    fn analyze_start_byte(nodes: &[AstNode], flags: &Flags) -> Option<u8> {
+        if nodes.is_empty() {
+            return None;
+        }
+
+        // If ignore_case is on, we can't easily use a single byte filter
+        // unless it's a non-cased char (like numbers/punctuation) or we handle multiple bytes.
+        // For simplicity: verify safety.
+        let ic = flags.ignore_case.unwrap_or(false);
+
+        match &nodes[0] {
+            AstNode::Literal(c) => {
+                // If char is ASCII and not cased OR we are case-sensitive.
+                // If ic is true, we can only return if to_lower == to_upper (numbers, symbols)
+                if ic && c.to_lowercase().next() != c.to_uppercase().next() {
+                    return None;
+                }
+
+                // Only support ASCII bytes for now to be safe with UTF-8 boundaries
+                if c.is_ascii() {
+                    return Some(*c as u8);
+                }
+            }
+            AstNode::Exact { node, .. } | AstNode::OneOrMore { node, .. } => {
+                // Recurse into the inner node?
+                // Only if it's a wrapper around a literal.
+                // Check if inner node is literal
+                if let AstNode::Literal(c) = &**node {
+                    if ic && c.to_lowercase().next() != c.to_uppercase().next() {
+                        return None;
+                    }
+                    if c.is_ascii() {
+                        return Some(*c as u8);
+                    }
+                }
+            }
+            // Add more cases here (Concat?) - Backtracking AST doesn't have explicit Concat node, it's a Vec.
+            // So nodes[0] is the first instruction.
+            _ => {}
+        }
+        None
     }
 }
 
@@ -808,12 +902,12 @@ impl crate::engine::CompiledRegexHaystack for BacktrackingRegex {
     }
 
     fn find_from<H: Haystack>(&self, haystack: H) -> Option<Match> {
-        let matcher = Matcher::new(&self.ast, &self.flags, haystack);
+        let matcher = Matcher::new(&self.ast, &self.flags, haystack, self.start_byte);
         matcher.find()
     }
 
     fn find_from_at<H: Haystack>(&self, haystack: H, start: usize) -> Option<Match> {
-        let matcher = Matcher::new(&self.ast, &self.flags, haystack);
+        let matcher = Matcher::new(&self.ast, &self.flags, haystack, self.start_byte);
         matcher.find_at(start)
     }
 
