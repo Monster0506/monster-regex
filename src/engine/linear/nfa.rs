@@ -1,3 +1,4 @@
+use crate::flags::Flags;
 use crate::parser::CharClass;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +34,7 @@ pub struct Nfa {
     pub states: Vec<State>,
     pub start: usize,
     pub match_state: usize,
+    pub flags: Flags,
 }
 
 impl Nfa {
@@ -41,6 +43,7 @@ impl Nfa {
             states: Vec::new(),
             start: 0,
             match_state: 0,
+            flags: Flags::default(),
         }
     }
 
@@ -48,5 +51,11 @@ impl Nfa {
         let id = self.states.len();
         self.states.push(state);
         id
+    }
+}
+
+impl Default for Nfa {
+    fn default() -> Self {
+        Self::new()
     }
 }

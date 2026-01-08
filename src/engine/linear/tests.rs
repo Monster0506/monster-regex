@@ -3,6 +3,7 @@ mod tests {
     use super::super::compiler::Compiler;
     use super::super::vm::PikeVM;
     use crate::flags::Flags;
+    use crate::haystack::Haystack;
     use crate::parser::Parser;
 
     fn compile_and_run(pattern: &str, text: &str) -> Option<(usize, usize)> {

@@ -22,6 +22,7 @@ impl Compiler {
 
         let match_state = self.nfa.add_state(State::Match);
         self.nfa.match_state = match_state;
+        self.nfa.flags = self.flags;
         self.patch(outs, match_state);
 
         Ok(self.nfa)
@@ -78,7 +79,7 @@ impl Compiler {
                     Ok((s, vec![s]))
                 }
             }
-            AstNode::CharClass(class) if matches!(class, crate::parser::CharClass::Dot) => {
+            AstNode::CharClass(crate::parser::CharClass::Dot) => {
                 if self.flags.dotall {
                     let s = self.nfa.add_state(State::Class(
                         crate::parser::CharClass::Set {
@@ -302,10 +303,10 @@ impl Compiler {
                 };
 
                 if *min > 0 {
-                    if let Some(_) = max {
-                        if Some(*min) == *max {
-                            return Ok((min_start, min_outs));
-                        }
+                    if let Some(_) = max
+                        && Some(*min) == *max
+                    {
+                        return Ok((min_start, min_outs));
                     }
 
                     let has_infinite = max.is_none();
@@ -319,14 +320,12 @@ impl Compiler {
                         // Only min part
                         Ok((min_start, min_outs))
                     }
+                } else if *max == Some(0) {
+                    // Empty match
+                    let s = self.nfa.add_state(State::Jump(0));
+                    Ok((s, vec![s]))
                 } else {
-                    if *max == Some(0) {
-                        // Empty match
-                        let s = self.nfa.add_state(State::Jump(0));
-                        Ok((s, vec![s]))
-                    } else {
-                        Ok((opt_start, opt_outs))
-                    }
+                    Ok((opt_start, opt_outs))
                 }
             }
             _ => Err(CompileError::InvalidPattern(

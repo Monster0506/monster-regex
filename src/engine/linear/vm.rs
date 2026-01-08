@@ -46,7 +46,7 @@ impl PikeVM {
             // Check matches in current_states
             if let Some(caps) = &current_states[self.nfa.match_state] {
                 // Determine start from caps[0]
-                let start = caps.get(0).copied().flatten().unwrap_or(pos); // Default?
+                let start = caps.first().copied().flatten().unwrap_or(pos); // Default?
                 // End is current pos.
 
                 let new_match = Match { start, end: pos };
@@ -121,7 +121,7 @@ impl PikeVM {
         current_pos: usize,
         text: &H,
     ) {
-        if let Some(_) = states[sid] {
+        if states[sid].is_some() {
             return;
         }
 
@@ -209,18 +209,77 @@ impl PikeVM {
             NonWord => !(c.is_alphanumeric() || c == '_'),
             Whitespace => c.is_whitespace(),
             NonWhitespace => !c.is_whitespace(),
-            Dot => c != '\n',
+            Dot => self.nfa.flags.dotall || c != '\n',
+            Lowercase => {
+                c.is_lowercase()
+                    || (self.nfa.flags.ignore_case.unwrap_or(false) && c.is_uppercase())
+            }
+            NonLowercase => {
+                !c.is_lowercase()
+                    && (!self.nfa.flags.ignore_case.unwrap_or(false) || !c.is_uppercase())
+            }
+            Uppercase => {
+                c.is_uppercase()
+                    || (self.nfa.flags.ignore_case.unwrap_or(false) && c.is_lowercase())
+            }
+            NonUppercase => {
+                !c.is_uppercase()
+                    && (!self.nfa.flags.ignore_case.unwrap_or(false) || !c.is_lowercase())
+            }
+            Hex => c.is_ascii_hexdigit(),
+            NonHex => !c.is_ascii_hexdigit(),
+            Octal => c.is_digit(8),
+            NonOctal => !c.is_digit(8),
+            Alphanumeric => c.is_alphanumeric(),
+            NonAlphanumeric => !c.is_alphanumeric(),
+            Punctuation => c.is_ascii_punctuation(),
+            NonPunctuation => !c.is_ascii_punctuation(),
+            WordStart => c.is_alphabetic() || c == '_',
+            NonWordStart => !(c.is_alphabetic() || c == '_'),
             Set { chars, negated } => {
-                let mut found = false;
-                for range in chars {
+                let ignore_case = self.nfa.flags.ignore_case.unwrap_or(false);
+                let found = chars.iter().any(|range| {
                     if c >= range.start && c <= range.end {
-                        found = true;
-                        break;
+                        return true;
                     }
-                }
+                    if ignore_case {
+                        if c.to_lowercase()
+                            .any(|lc| lc >= range.start && lc <= range.end)
+                        {
+                            return true;
+                        }
+                        if c.to_uppercase()
+                            .any(|uc| uc >= range.start && uc <= range.end)
+                        {
+                            return true;
+                        }
+                    }
+                    false
+                });
                 if *negated { !found } else { found }
             }
-            _ => false,
         }
     }
+}
+
+fn is_word_boundary<H: Haystack>(text: &H, pos: usize) -> bool {
+    let prev = text.char_before(pos);
+    let curr = text.char_at(pos).map(|(c, _)| c);
+    is_word_char(prev) != is_word_char(curr)
+}
+
+fn is_word_start<H: Haystack>(text: &H, pos: usize) -> bool {
+    let prev = text.char_before(pos);
+    let curr = text.char_at(pos).map(|(c, _)| c);
+    !is_word_char(prev) && is_word_char(curr)
+}
+
+fn is_word_end<H: Haystack>(text: &H, pos: usize) -> bool {
+    let prev = text.char_before(pos);
+    let curr = text.char_at(pos).map(|(c, _)| c);
+    is_word_char(prev) && !is_word_char(curr)
+}
+
+fn is_word_char(c: Option<char>) -> bool {
+    c.is_some_and(|c| c.is_alphanumeric() || c == '_')
 }
