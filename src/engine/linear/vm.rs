@@ -18,38 +18,45 @@ struct ActiveState {
 struct ThreadList {
     /// Active states with origins
     states: Vec<ActiveState>,
-    /// Deduplication: true if state is currently active (1 byte per state!)
-    seen: Vec<bool>,
+    /// Generation-based deduplication (4 bytes per state but O(1) clear!)
+    /// State is active if seen[pc] == generation
+    seen: Vec<u32>,
+    /// Current generation (incremented on clear)
+    generation: u32,
 }
 
 impl ThreadList {
     fn new(capacity: usize) -> Self {
         Self {
             states: Vec::with_capacity(capacity),
-            seen: vec![false; capacity],
+            seen: vec![0; capacity],
+            generation: 1, // Start at 1 so 0 means "never seen"
         }
     }
 
+    /// O(1) clear - just increment generation!
     fn clear(&mut self) {
-        for state in &self.states {
-            self.seen[state.pc] = false;
-        }
         self.states.clear();
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generation = 1; // Skip 0 to avoid false positives
+        }
     }
 
+    #[inline(always)]
     fn contains(&self, pc: usize) -> bool {
-        self.seen[pc]
+        self.seen[pc] == self.generation
     }
 
     /// Insert state with origin. First insertion wins (earliest origin).
-    /// O(1) - simple boolean check
+    /// O(1) - simple generation check
     #[inline(always)]
     fn insert(&mut self, pc: usize, origin: usize) {
-        if !self.seen[pc] {
-            self.seen[pc] = true;
+        if self.seen[pc] != self.generation {
+            self.seen[pc] = self.generation;
             self.states.push(ActiveState { pc, origin });
         }
-        // If already seen, skip - first insertion wins (leftmost match)
+        // If already seen this generation, skip - first insertion wins
     }
 
     fn is_empty(&self) -> bool {
