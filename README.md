@@ -11,24 +11,79 @@ Add `monster-regex` to your `Cargo.toml`:
 monster-regex = "0.1.0"
 ```
 
-### Basic Example
+### Basic Example (Backtracking Engine)
+
+By default, `Regex::new` uses the `BacktrackingRegexEngine`. This engine supports advanced features like lookarounds and backreferences but may have exponential runtime on pathological patterns.
 
 ```rust
 use monster_regex::{Regex, Flags};
 
 fn main() {
-    // Compile a regex
+    // Compile using the default backtracking engine
     let re = Regex::new(r"\w+", Flags::default()).unwrap();
 
-    // Check for a match
     assert!(re.is_match("hello"));
-
+    
     // Find a match
     if let Some(m) = re.find("hello world") {
         println!("Found match at {}-{}", m.start, m.end); // 0-5
     }
 }
 ```
+
+### Linear Engine (O(n))
+
+For performance-critical code where O(n) guarantees are required, use the `LinearRegexEngine` (based on PikeVM). Note that this engine does not support lookarounds or backreferences.
+
+```rust
+use monster_regex::{Regex, Flags};
+
+fn main() {
+    // Explicit constructor for the linear engine
+    let re = Regex::new_linear(r"a.*b", Flags::default()).unwrap();
+    assert!(re.is_match("abbb"));
+}
+```
+
+### Dynamic Engine Dispatch
+
+You can switch between engines at runtime using `AnyRegexEngine`. This allows you to choose the best engine for the pattern or use case.
+
+```rust
+use monster_regex::engine::{
+    AnyRegexEngine, RegexEngine, CompiledRegex, 
+    backtracking::BacktrackingRegexEngine, 
+    linear::LinearRegexEngine
+};
+use monster_regex::Flags;
+
+fn main() {
+    let use_linear = true;
+    let flags = Flags::default();
+    let pattern = "abc";
+
+    // Type-erased engine trait object
+    let engine: Box<dyn RegexEngine<Regex = Box<dyn CompiledRegex>>> = if use_linear {
+        Box::new(AnyRegexEngine(LinearRegexEngine))
+    } else {
+        Box::new(AnyRegexEngine(BacktrackingRegexEngine))
+    };
+
+    // Compile returns a Box<dyn CompiledRegex>
+    let regex = engine.compile(pattern, flags).unwrap();
+    
+    assert!(regex.is_match("abc"));
+}
+```
+
+### Architecture & Traits
+
+`monster-regex` exposes two key traits for compiled regexes:
+
+1.  **`CompiledRegex`**: Object-safe trait containing core methods (`is_match`, `find`, `captures`, `replace`). Usable with `&str`. This is the return type when using dynamic dispatch.
+2.  **`CompiledRegexHaystack`**: Generic trait extending `CompiledRegex` for streaming support via the `Haystack` trait. **Not object-safe**.
+
+When using dynamic dispatch (`Box<dyn CompiledRegex>`), you are limited to the methods in `CompiledRegex` (string-based) and cannot use the streaming `Haystack` API directly on the trait object.
 
 ### Using Flags
 
