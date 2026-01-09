@@ -98,13 +98,19 @@ impl VMContext {
     }
 }
 
-use std::sync::Mutex;
+use std::cell::UnsafeCell;
 
 pub struct PikeVM {
     nfa: Nfa,
     start_byte: Option<u8>,
-    ctx: Mutex<VMContext>,
+    /// UnsafeCell for zero-overhead interior mutability
+    /// SAFETY: PikeVM is used single-threaded per operation
+    ctx: UnsafeCell<VMContext>,
 }
+
+// SAFETY: PikeVM operations are inherently single-threaded
+// The UnsafeCell is only accessed during find operations
+unsafe impl Sync for PikeVM {}
 
 #[cfg(feature = "internal_metrics")]
 #[derive(Debug, Default)]
@@ -120,7 +126,7 @@ impl PikeVM {
         Self {
             nfa,
             start_byte,
-            ctx: Mutex::new(VMContext::new(num_states)),
+            ctx: UnsafeCell::new(VMContext::new(num_states)),
         }
     }
 
@@ -203,8 +209,8 @@ impl PikeVM {
 
     #[inline(always)]
     fn find_raw_prefilter<H: Haystack>(&self, text: H, start_index: usize) -> Option<Match> {
-        let mut guard = self.ctx.lock().unwrap();
-        let ctx = &mut *guard; // Dereference to allow split borrows
+        // SAFETY: PikeVM find operations are single-threaded
+        let ctx = unsafe { &mut *self.ctx.get() };
         ctx.reset();
 
         let len = text.len();
@@ -374,8 +380,8 @@ impl PikeVM {
 
     #[inline(always)]
     fn find_raw_baseline<H: Haystack>(&self, text: H, start_index: usize) -> Option<Match> {
-        let mut guard = self.ctx.lock().unwrap();
-        let ctx = &mut *guard; // Dereference to allow split borrows
+        // SAFETY: PikeVM find operations are single-threaded
+        let ctx = unsafe { &mut *self.ctx.get() };
         ctx.reset();
 
         let len = text.len();
