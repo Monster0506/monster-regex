@@ -8,7 +8,7 @@ Add `monster-regex` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-monster-regex = "0.1.0"
+monster-regex = "0.2.2"
 ```
 
 ### Basic Example (Backtracking Engine)
@@ -140,8 +140,49 @@ use monster_regex::{Regex, Flags};
 
 fn main() {
     let re = Regex::new(r"foo", Flags::default()).unwrap();
+    
+    // Replace first occurrence only
+    let result = re.replace("foo bar foo", "baz");
+    assert_eq!(result, "baz bar foo");
+    
+    // Replace all occurrences
     let result = re.replace_all("foo bar foo", "baz");
     assert_eq!(result, "baz bar baz");
+}
+```
+
+### Captures Iterator
+
+```rust
+use monster_regex::{Regex, Flags};
+
+fn main() {
+    let re = Regex::new(r"(\w+)@(\w+)", Flags::default()).unwrap();
+    let text = "alice@home bob@work";
+
+    for caps in re.captures_all(text) {
+        println!("Full match: {:?}", caps.full_match);
+        println!("Groups: {:?}", caps.groups);
+    }
+}
+```
+
+### Inspecting Pattern and Flags
+
+```rust
+use monster_regex::{Regex, Flags};
+
+fn main() {
+    let mut flags = Flags::default();
+    flags.ignore_case = Some(true);
+    
+    let re = Regex::new(r"hello", flags).unwrap();
+    
+    // Access the original pattern
+    assert_eq!(re.pattern(), "hello");
+    
+    // Access the flags used during compilation
+    assert_eq!(re.flags().ignore_case, Some(true));
 }
 ```
 
@@ -170,9 +211,19 @@ fn main() {
     let rope = MyRope { /* ... */ };
     let re = Regex::new("pattern", Default::default()).unwrap();
 
-    // Find generic match
+    // Check if pattern matches anywhere
+    if re.is_match_from(rope) {
+        println!("Found a match!");
+    }
+
+    // Find first match
     if let Some(m) = re.find_from(rope) {
          println!("Match at {}-{}", m.start, m.end);
+    }
+    
+    // Find match starting at a specific offset
+    if let Some(m) = re.find_from_at(rope, 10) {
+        println!("Match starting from offset 10: {}-{}", m.start, m.end);
     }
 
     // Iterate all matches
