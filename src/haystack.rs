@@ -1,38 +1,33 @@
 /// A trait for text that can be searched by the regex engine.
-/// This abstraction allows searching over non-contiguous memory (like ropes)
-/// without flattening to a single string.
 pub trait Haystack: Copy + Clone {
     type Cursor: HaystackCursor;
 
-    /// Total length of the haystack in bytes
     fn len(&self) -> usize;
 
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Get a cursor for streaming access starting at `pos`
     fn cursor_at(&self, pos: usize) -> Self::Cursor;
 
-    /// Get character at position
     fn char_at(&self, pos: usize) -> Option<(char, usize)>;
 
-    /// Get character before position
     fn char_before(&self, pos: usize) -> Option<char>;
 
-    /// Check if haystack starts with literal at pos
     fn starts_with(&self, pos: usize, literal: &str) -> bool;
 
-    /// Check if range matches another range
     fn matches_range(&self, pos: usize, other_start: usize, other_end: usize) -> bool;
 
-    /// Find the first occurrence of a byte starting at `pos`.
-    /// Returns `None` if not found.
     fn find_byte(&self, byte: u8, pos: usize) -> Option<usize>;
+
+    /// Return a contiguous byte slice for the entire haystack, if available.
+    /// Non-contiguous haystacks (e.g. ropes) should return `None`.
+    fn as_bytes_opt(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 pub trait HaystackCursor: Iterator<Item = char> + Clone {
-    /// Peek at the next character without advancing
     fn peek(&self) -> Option<char>;
 }
 
@@ -58,7 +53,13 @@ impl<'a> Haystack for &'a str {
         if pos == 0 || pos > self.len() {
             return None;
         }
-        self[..pos].chars().last()
+        let bytes = self.as_bytes();
+        // Scan backwards over UTF-8 continuation bytes (0b10xxxxxx)
+        let mut i = pos - 1;
+        while i > 0 && bytes[i] & 0xC0 == 0x80 {
+            i -= 1;
+        }
+        self[i..pos].chars().next()
     }
 
     #[inline]
@@ -90,7 +91,12 @@ impl<'a> Haystack for &'a str {
         if pos >= self.len() {
             return None;
         }
-        memchr::memchr(byte, self[pos..].as_bytes()).map(|i| i + pos)
+        memchr::memchr(byte, &self.as_bytes()[pos..]).map(|i| i + pos)
+    }
+
+    #[inline]
+    fn as_bytes_opt(&self) -> Option<&[u8]> {
+        Some(str::as_bytes(self))
     }
 }
 

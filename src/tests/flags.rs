@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use crate::{Flags, Regex, parse_rift_format};
 
 // Helper to assert flag parsing

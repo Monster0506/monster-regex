@@ -1,32 +1,33 @@
 #[cfg(test)]
+#[allow(clippy::module_inception, clippy::field_reassign_with_default)]
 mod tests {
     use super::super::compiler::Compiler;
-    use super::super::vm::PikeVM;
+    use super::super::vm::{PikeVM, StartFilter};
     use crate::flags::Flags;
     use crate::haystack::Haystack;
     use crate::parser::Parser;
 
     fn compile_and_run(pattern: &str, text: &str) -> Option<(usize, usize)> {
         let flags = Flags::default();
-        let mut parser = Parser::new(pattern, flags.clone());
+        let mut parser = Parser::new(pattern, flags);
         let ast = parser.parse().expect("Parse failed");
 
         let compiler = Compiler::new(flags);
         let nfa = compiler.compile(&ast).expect("Compile failed");
 
-        let vm = PikeVM::new(nfa, None);
+        let vm = PikeVM::new(nfa, StartFilter::None, None);
         let m = vm.find_from(text, 0)?;
         Some((m.start, m.end))
     }
 
     fn compile_and_run_flags(pattern: &str, text: &str, flags: Flags) -> Option<(usize, usize)> {
-        let mut parser = Parser::new(pattern, flags.clone());
+        let mut parser = Parser::new(pattern, flags);
         let ast = parser.parse().expect("Parse failed");
 
         let compiler = Compiler::new(flags);
         let nfa = compiler.compile(&ast).expect("Compile failed");
 
-        let vm = PikeVM::new(nfa, None);
+        let vm = PikeVM::new(nfa, StartFilter::None, None);
         let m = vm.find_from(text, 0)?;
         Some((m.start, m.end))
     }
@@ -184,13 +185,17 @@ mod tests {
                 }
             } else {
                 let offset = pos - self.first.len();
-                if offset < self.second.len() {
-                    if let Some(i) = self.second[offset..].bytes().position(|b| b == byte) {
-                        return Some(pos + i);
-                    }
+                if offset < self.second.len()
+                    && let Some(i) = self.second[offset..].bytes().position(|b| b == byte)
+                {
+                    return Some(pos + i);
                 }
             }
             None
+        }
+
+        fn as_bytes_opt(&self) -> Option<&[u8]> {
+            None // non-contiguous
         }
     }
 
@@ -200,13 +205,13 @@ mod tests {
         let pattern = "bcd";
 
         let flags = Flags::default();
-        let mut parser = Parser::new(pattern, flags.clone());
+        let mut parser = Parser::new(pattern, flags);
         let ast = parser.parse().expect("Parse failed");
 
         let compiler = Compiler::new(flags);
         let nfa = compiler.compile(&ast).expect("Compile failed");
 
-        let vm = PikeVM::new(nfa, None);
+        let vm = PikeVM::new(nfa, StartFilter::None, None);
         let m = vm.find_from(haystack, 0).expect("Match not found");
 
         // b at index 1, c at 2, d at 3 (start of second chunk)
@@ -237,7 +242,7 @@ mod tests {
     fn test_flags() {
         let mut flags = Flags::default();
         flags.ignore_case = Some(true);
-        assert_eq!(compile_and_run_flags("a", "A", flags.clone()), Some((0, 1)));
+        assert_eq!(compile_and_run_flags("a", "A", flags), Some((0, 1)));
 
         let mut flags = Flags::default();
         flags.dotall = true;

@@ -15,7 +15,7 @@ fn test_regex_methods_existence() {
     let re = Regex::new("abc", flags).unwrap();
     let text = "abc def abc";
 
-    assert_eq!(re.is_match(text), true);
+    assert!(re.is_match(text));
     assert!(re.find(text).is_some());
     assert!(re.captures(text).is_none());
 
@@ -33,9 +33,9 @@ fn test_regex_methods_existence() {
 fn test_flags_default() {
     let flags = Flags::default();
     assert_eq!(flags.ignore_case, None);
-    assert_eq!(flags.multiline, false);
-    assert_eq!(flags.dotall, false);
-    assert_eq!(flags.verbose, false);
-    assert_eq!(flags.unicode, false);
-    assert_eq!(flags.global, false);
+    assert!(!flags.multiline);
+    assert!(!flags.dotall);
+    assert!(!flags.verbose);
+    assert!(!flags.unicode);
+    assert!(!flags.global);
 }

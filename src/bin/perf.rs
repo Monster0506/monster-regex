@@ -28,10 +28,8 @@ fn generate_dna(len: usize) -> String {
 fn run_bench(name: &str, mut f: impl FnMut()) {
     // Warmup
     let start = Instant::now();
-    let mut iterations = 0;
     while start.elapsed().as_millis() < 100 {
         f();
-        iterations += 1;
     }
 
     // Measure

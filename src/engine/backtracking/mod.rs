@@ -9,7 +9,7 @@ pub struct Matcher<'a, H: Haystack> {
     nodes: &'a [AstNode],
     flags: &'a Flags,
     text: H,
-    start_byte: Option<u8>,
+    prefilter: &'a Prefilter,
 }
 
 struct QuantifierParams {
@@ -43,12 +43,12 @@ impl MatchContext {
 
 impl<'a, H: Haystack> Matcher<'a, H> {
     /// Creates a new Matcher instance.
-    pub fn new(nodes: &'a [AstNode], flags: &'a Flags, text: H, start_byte: Option<u8>) -> Self {
+    pub fn new(nodes: &'a [AstNode], flags: &'a Flags, text: H, prefilter: &'a Prefilter) -> Self {
         Self {
             nodes,
             flags,
             text,
-            start_byte,
+            prefilter,
         }
     }
 
@@ -65,83 +65,51 @@ impl<'a, H: Haystack> Matcher<'a, H> {
 
         let mut context = MatchContext::new(max_group);
 
-        if let Some(sb) = self.start_byte {
-            // OPTIMIZED PATH: Scan using memchr, then try match
-            let mut pos = start_index;
-            while pos < len {
-                if let Some(next_pos) = self.text.find_byte(sb, pos) {
-                    pos = next_pos; // Jump to candidate
+        let has_filter = self.prefilter.has_filter();
+        let mut pos = start_index;
 
-                    let mut cursor = self.text.cursor_at(pos);
-                    // Optimization: We know we are at a byte match.
-                    // We need prev_char.
-                    // If pos > start_index ... actually just use char_before.
-                    let prev_char = if pos > 0 {
-                        self.text.char_before(pos)
-                    } else {
-                        None
-                    };
-
-                    context.clear();
-                    let mut match_cursor = cursor.clone();
-
-                    if let Some(end_pos) = self.match_nodes(
-                        self.nodes,
-                        pos,
-                        &mut context,
-                        &mut match_cursor,
-                        prev_char,
-                    ) {
-                        let start = context.match_start_override.unwrap_or(pos);
-                        let end = context.match_end_override.unwrap_or(end_pos);
-                        return Some(Match { start, end });
-                    }
-
-                    // No match, advance past this byte
-                    if let Some(c) = cursor.next() {
-                        pos += c.len_utf8();
-                    } else {
-                        break; // Should not happen if pos < len
-                    }
-                } else {
-                    return None; // Start byte not found in remainder
+        while pos <= len {
+            // When a prefilter is available, jump straight to the next position
+            // whose first consuming character can begin a match. This skips the
+            // O(N) per-position attempt loop for patterns anchored by a literal,
+            // even when that literal is preceded by zero-width assertions such as
+            // `^`, `\b`, or a lookbehind. Without a filter we fall back to checking
+            // every character boundary.
+            if has_filter {
+                match self.prefilter.find_next(&self.text, pos) {
+                    Some(p) => pos = p,
+                    None => return None,
+                }
+                if pos > len {
+                    break;
                 }
             }
-        } else {
-            // NAIVE PATH: Check every character boundary (Baseline performance)
-            let mut pos = start_index;
 
             let mut cursor = self.text.cursor_at(pos);
-            let mut prev_char = if pos > 0 {
+            let prev_char = if pos > 0 {
                 self.text.char_before(pos)
             } else {
                 None
             };
 
-            while pos <= len {
-                context.clear();
+            context.clear();
+            let mut match_cursor = cursor.clone();
 
-                let mut match_cursor = cursor.clone();
+            if let Some(end_pos) =
+                self.match_nodes(self.nodes, pos, &mut context, &mut match_cursor, prev_char)
+            {
+                let start = context.match_start_override.unwrap_or(pos);
+                let end = context.match_end_override.unwrap_or(end_pos);
+                return Some(Match { start, end });
+            }
 
-                if let Some(end_pos) =
-                    self.match_nodes(self.nodes, pos, &mut context, &mut match_cursor, prev_char)
-                {
-                    let start = context.match_start_override.unwrap_or(pos);
-                    let end = context.match_end_override.unwrap_or(end_pos);
-                    return Some(Match { start, end });
-                }
-
-                // Advance to next char
-                if pos < len {
-                    if let Some(c) = cursor.next() {
-                        prev_char = Some(c);
-                        pos += c.len_utf8();
-                    } else {
-                        pos += 1; // Should not happen
-                    }
-                } else {
-                    break;
-                }
+            // No match at `pos`; advance one character and try again.
+            if pos >= len {
+                break;
+            }
+            match cursor.next() {
+                Some(c) => pos += c.len_utf8(),
+                None => break,
             }
         }
         None
@@ -410,9 +378,17 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 // But wait, inside lookbehind we match backwards or simulate it.
                 // Current impl simulates by trying all start positions ending at pos.
                 let mut matched = false;
-                // Optimization: If lookbehind is fixed length, we only check one spot.
-                // But general case requires loop.
-                for start in 0..=pos {
+                // Only start positions within the lookbehind's maximum match length
+                // can possibly end at `pos`. Bounding the scan to that window turns
+                // the naive `0..=pos` loop - which makes lookbehind O(N^2) over a full
+                // search - into O(max_len) per position. A fixed-length lookbehind such
+                // as `(?<!x)` collapses to a single candidate start. Unbounded inner
+                // patterns (containing `*`/`+`/`{n,}`/backrefs) fall back to `0`.
+                let lo = match max_consumable_bytes(look_nodes) {
+                    Some(max_len) => pos.saturating_sub(max_len),
+                    None => 0,
+                };
+                for start in lo..=pos {
                     let mut look_ctx = ctx.clone();
                     let mut look_cursor = self.text.cursor_at(start);
                     // For the inner match, we need prev_char at 'start'. Expensive?
@@ -760,7 +736,7 @@ pub struct BacktrackingRegex {
     ast: Vec<AstNode>,
     flags: Flags,
     pattern: String,
-    start_byte: Option<u8>,
+    prefilter: Prefilter,
 }
 
 impl BacktrackingRegex {
@@ -777,57 +753,14 @@ impl BacktrackingRegex {
             .parse()
             .map_err(|e| CompileError::InvalidPattern(e.to_string()))?;
 
-        let start_byte = Self::analyze_start_byte(&ast, &flags);
+        let prefilter = analyze_prefilter(&ast, &flags);
 
         Ok(BacktrackingRegex {
             ast,
             flags,
             pattern: pattern.to_string(),
-            start_byte,
+            prefilter,
         })
-    }
-
-    fn analyze_start_byte(nodes: &[AstNode], flags: &Flags) -> Option<u8> {
-        if nodes.is_empty() {
-            return None;
-        }
-
-        // If ignore_case is on, we can't easily use a single byte filter
-        // unless it's a non-cased char (like numbers/punctuation) or we handle multiple bytes.
-        // For simplicity: verify safety.
-        let ic = flags.ignore_case.unwrap_or(false);
-
-        match &nodes[0] {
-            AstNode::Literal(c) => {
-                // If char is ASCII and not cased OR we are case-sensitive.
-                // If ic is true, we can only return if to_lower == to_upper (numbers, symbols)
-                if ic && c.to_lowercase().next() != c.to_uppercase().next() {
-                    return None;
-                }
-
-                // Only support ASCII bytes for now to be safe with UTF-8 boundaries
-                if c.is_ascii() {
-                    return Some(*c as u8);
-                }
-            }
-            AstNode::Exact { node, .. } | AstNode::OneOrMore { node, .. } => {
-                // Recurse into the inner node?
-                // Only if it's a wrapper around a literal.
-                // Check if inner node is literal
-                if let AstNode::Literal(c) = &**node {
-                    if ic && c.to_lowercase().next() != c.to_uppercase().next() {
-                        return None;
-                    }
-                    if c.is_ascii() {
-                        return Some(*c as u8);
-                    }
-                }
-            }
-            // Add more cases here (Concat?) - Backtracking AST doesn't have explicit Concat node, it's a Vec.
-            // So nodes[0] is the first instruction.
-            _ => {}
-        }
-        None
     }
 }
 
@@ -902,12 +835,12 @@ impl crate::engine::CompiledRegexHaystack for BacktrackingRegex {
     }
 
     fn find_from<H: Haystack>(&self, haystack: H) -> Option<Match> {
-        let matcher = Matcher::new(&self.ast, &self.flags, haystack, self.start_byte);
+        let matcher = Matcher::new(&self.ast, &self.flags, haystack, &self.prefilter);
         matcher.find()
     }
 
     fn find_from_at<H: Haystack>(&self, haystack: H, start: usize) -> Option<Match> {
-        let matcher = Matcher::new(&self.ast, &self.flags, haystack, self.start_byte);
+        let matcher = Matcher::new(&self.ast, &self.flags, haystack, &self.prefilter);
         matcher.find_at(start)
     }
 
@@ -937,8 +870,263 @@ impl<'a, H: Haystack> Iterator for FindMatchesIterator<'a, H> {
         if self.last_end > self.text.len() {
             return None;
         }
-        let m = self.regex.find_from_at(self.text.clone(), self.last_end)?;
+        let m = self.regex.find_from_at(self.text, self.last_end)?;
         self.last_end = m.end.max(m.start + 1);
         Some(m)
+    }
+}
+
+// -- Start prefilter ------------------------------------------------------------
+
+/// A cheap test that locates the next position where a match could *start*,
+/// letting `find_at` skip over input that provably cannot begin a match.
+///
+/// A pattern's match always begins by consuming the first non-assertion atom, so
+/// the byte at the match-start position is constrained even when the pattern opens
+/// with zero-width assertions (`^`, `\b`, lookahead/lookbehind, `\zs`). We exploit
+/// that to scan with `memchr`/`memmem` instead of attempting a full match at every
+/// position.
+#[derive(Clone, Debug)]
+pub enum Prefilter {
+    /// No usable constraint - caller must try every position.
+    None,
+    /// The first consumed byte must equal this (case-sensitive).
+    Byte(u8),
+    /// The first consumed byte is one of a case pair (lowercase, uppercase).
+    ByteCasePair(u8, u8),
+    /// The match must begin with this ASCII literal run. When `ci` is set, `bytes`
+    /// is stored lowercased and comparison is ASCII-case-insensitive.
+    Literal { bytes: Box<[u8]>, ci: bool },
+}
+
+impl Prefilter {
+    #[inline]
+    fn has_filter(&self) -> bool {
+        !matches!(self, Prefilter::None)
+    }
+
+    /// Find the next candidate match-start at or after `pos`, or `None` if no
+    /// further candidate exists.
+    #[inline]
+    fn find_next<H: Haystack>(&self, text: &H, pos: usize) -> Option<usize> {
+        match self {
+            Prefilter::None => Some(pos),
+            Prefilter::Byte(b) => text.find_byte(*b, pos),
+            Prefilter::ByteCasePair(lo, up) => {
+                if let Some(bytes) = text.as_bytes_opt() {
+                    if pos >= bytes.len() {
+                        return None;
+                    }
+                    memchr::memchr2(*lo, *up, &bytes[pos..]).map(|i| i + pos)
+                } else {
+                    min_opt(text.find_byte(*lo, pos), text.find_byte(*up, pos))
+                }
+            }
+            Prefilter::Literal { bytes, ci } => {
+                if let Some(hay) = text.as_bytes_opt() {
+                    find_literal_bytes(hay, bytes, *ci, pos)
+                } else {
+                    // Non-contiguous haystack: filter on the first byte only; the
+                    // full match attempt verifies the remaining bytes.
+                    let first = bytes[0];
+                    if *ci {
+                        let up = first.to_ascii_uppercase();
+                        if first == up {
+                            text.find_byte(first, pos)
+                        } else {
+                            min_opt(text.find_byte(first, pos), text.find_byte(up, pos))
+                        }
+                    } else {
+                        text.find_byte(first, pos)
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn min_opt(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (x, y) => x.or(y),
+    }
+}
+
+/// Locate `needle` within `hay[from..]`. When `ci` is set, `needle` is assumed to
+/// already be lowercased and the comparison is ASCII-case-insensitive.
+fn find_literal_bytes(hay: &[u8], needle: &[u8], ci: bool, from: usize) -> Option<usize> {
+    if from > hay.len() {
+        return None;
+    }
+    if needle.is_empty() {
+        return Some(from);
+    }
+    if !ci {
+        return memchr::memmem::find(&hay[from..], needle).map(|i| i + from);
+    }
+
+    // Case-insensitive ASCII: scan for the first byte (either case), then verify.
+    let first = needle[0];
+    let first_up = first.to_ascii_uppercase();
+    let mut pos = from;
+    loop {
+        if pos >= hay.len() {
+            return None;
+        }
+        let sub = &hay[pos..];
+        let idx = if first != first_up {
+            memchr::memchr2(first, first_up, sub)?
+        } else {
+            memchr::memchr(first, sub)?
+        };
+        let abs = pos + idx;
+        let end = abs + needle.len();
+        if end > hay.len() {
+            return None;
+        }
+        if hay[abs..end]
+            .iter()
+            .zip(needle.iter())
+            .all(|(&h, &n)| h.to_ascii_lowercase() == n)
+        {
+            return Some(abs);
+        }
+        pos = abs + 1;
+    }
+}
+
+/// True for nodes that consume no input (they only assert a position).
+fn is_zero_width(node: &AstNode) -> bool {
+    matches!(
+        node,
+        AstNode::StartAnchor
+            | AstNode::EndAnchor
+            | AstNode::WordBoundary
+            | AstNode::StartWord
+            | AstNode::EndWord
+            | AstNode::SetMatchStart
+            | AstNode::SetMatchEnd
+            | AstNode::LookAhead { .. }
+            | AstNode::LookBehind { .. }
+    )
+}
+
+/// Build a start prefilter from the pattern's leading nodes.
+///
+/// Leading zero-width assertions are skipped (the first *consumed* atom still pins
+/// the byte at the match-start position), then we prefer a multi-byte literal run
+/// and fall back to a single first byte.
+fn analyze_prefilter(nodes: &[AstNode], flags: &Flags) -> Prefilter {
+    let ic = flags.ignore_case.unwrap_or(false);
+
+    // Skip leading zero-width assertions.
+    let mut i = 0;
+    while i < nodes.len() && is_zero_width(&nodes[i]) {
+        i += 1;
+    }
+    let nodes = &nodes[i..];
+    if nodes.is_empty() {
+        return Prefilter::None;
+    }
+
+    // Prefer a run of ASCII literals - a stronger filter than a single byte.
+    let mut run: Vec<u8> = Vec::new();
+    for node in nodes {
+        match node {
+            AstNode::Literal(c) if c.is_ascii() => {
+                run.push(if ic {
+                    (*c as u8).to_ascii_lowercase()
+                } else {
+                    *c as u8
+                });
+            }
+            _ => break,
+        }
+    }
+    if run.len() >= 2 {
+        return Prefilter::Literal {
+            bytes: run.into_boxed_slice(),
+            ci: ic,
+        };
+    }
+
+    // Otherwise, derive a single first consuming byte (also peeking through a
+    // `+`/`{n}` wrapper around a literal, matching the original behavior).
+    let first = match &nodes[0] {
+        AstNode::Literal(c) => Some(*c),
+        AstNode::OneOrMore { node, .. } | AstNode::Exact { node, .. } => match &**node {
+            AstNode::Literal(c) => Some(*c),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    match first {
+        Some(c) if c.is_ascii() => {
+            let b = c as u8;
+            if ic {
+                let lo = b.to_ascii_lowercase();
+                let up = b.to_ascii_uppercase();
+                if lo == up {
+                    Prefilter::Byte(lo)
+                } else {
+                    Prefilter::ByteCasePair(lo, up)
+                }
+            } else {
+                Prefilter::Byte(b)
+            }
+        }
+        _ => Prefilter::None,
+    }
+}
+
+/// Upper bound, in bytes, on how much input a node sequence can consume.
+///
+/// Returns `None` when the sequence can match an unbounded amount of input
+/// (it contains `*`, `+`, an open-ended `{n,}`, or a backreference whose length
+/// is not known statically).
+///
+/// Used to window lookbehind scanning: a lookbehind that consumes at most `k`
+/// bytes only needs to test start positions in `[pos - k, pos]`.
+fn max_consumable_bytes(nodes: &[AstNode]) -> Option<usize> {
+    let mut total = 0usize;
+    for n in nodes {
+        total = total.checked_add(node_max_consumable_bytes(n)?)?;
+    }
+    Some(total)
+}
+
+fn node_max_consumable_bytes(node: &AstNode) -> Option<usize> {
+    match node {
+        AstNode::Literal(c) => Some(c.len_utf8()),
+        // A character class matches exactly one code point: at most 4 UTF-8 bytes.
+        AstNode::CharClass(_) => Some(4),
+        // Zero-width assertions consume no input.
+        AstNode::StartAnchor
+        | AstNode::EndAnchor
+        | AstNode::WordBoundary
+        | AstNode::StartWord
+        | AstNode::EndWord
+        | AstNode::SetMatchStart
+        | AstNode::SetMatchEnd
+        | AstNode::LookAhead { .. }
+        | AstNode::LookBehind { .. } => Some(0),
+        AstNode::Optional { node, .. } => node_max_consumable_bytes(node),
+        AstNode::ZeroOrMore { .. } | AstNode::OneOrMore { .. } => None,
+        AstNode::Exact { node, count } => node_max_consumable_bytes(node)?.checked_mul(*count),
+        AstNode::Range { node, max, .. } => match max {
+            Some(m) => node_max_consumable_bytes(node)?.checked_mul(*m),
+            None => None,
+        },
+        AstNode::Group { nodes, .. } => max_consumable_bytes(nodes),
+        AstNode::Alternation(alts) => {
+            let mut best = 0usize;
+            for alt in alts {
+                best = best.max(max_consumable_bytes(alt)?);
+            }
+            Some(best)
+        }
+        AstNode::Backref(_) => None,
     }
 }

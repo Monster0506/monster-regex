@@ -23,6 +23,11 @@ impl Regex<BacktrackingRegexEngine> {
         let compiled = engine.compile(pattern, flags)?;
         Ok(Regex { compiled })
     }
+
+    /// Returns an iterator over all non-overlapping matches.
+    pub fn find_all<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = Match> + 'a> {
+        self.compiled.find_all(text)
+    }
 }
 
 impl Regex<LinearRegexEngine> {
@@ -31,6 +36,14 @@ impl Regex<LinearRegexEngine> {
         let engine = LinearRegexEngine;
         let compiled = engine.compile(pattern, flags)?;
         Ok(Regex { compiled })
+    }
+
+    /// Returns an iterator over all non-overlapping matches.
+    ///
+    /// Returns a stack-allocated concrete type - no heap allocation for pure-literal
+    /// patterns, no vtable dispatch per match.
+    pub fn find_all<'a>(&'a self, text: &'a str) -> crate::engine::linear::LinearFindAll<'a> {
+        self.compiled.find_all_linear(text)
     }
 }
 
@@ -67,15 +80,6 @@ impl<E: RegexEngine> Regex<E> {
         E::Regex: crate::engine::CompiledRegexHaystack,
     {
         self.compiled.find_from_at(text, start)
-    }
-
-    /// Returns an iterator over all non-overlapping matches in the text.
-    pub fn find_all<'a>(&'a self, text: &'a str) -> FindAllIterator<'a, E> {
-        FindAllIterator {
-            text,
-            regex: self,
-            last_end: 0,
-        }
     }
 
     /// Returns an iterator over all non-overlapping matches in the haystack.
@@ -142,7 +146,7 @@ where
         if self.last_end > self.text.len() {
             return None;
         }
-        let m = self.regex.find_from_at(self.text.clone(), self.last_end)?;
+        let m = self.regex.find_from_at(self.text, self.last_end)?;
         self.last_end = m.end.max(m.start + 1);
         Some(m)
     }

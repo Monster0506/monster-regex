@@ -147,6 +147,10 @@ impl<'a> Haystack for ChunkedHaystack<'a> {
         true
     }
 
+    fn as_bytes_opt(&self) -> Option<&[u8]> {
+        None // non-contiguous
+    }
+
     fn find_byte(&self, byte: u8, pos: usize) -> Option<usize> {
         let mut p = pos;
         while p < self.len() {

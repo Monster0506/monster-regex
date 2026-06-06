@@ -12,32 +12,36 @@ static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
-        if !ptr.is_null() {
-            let size = layout.size();
-            let old_alloc = ALLOCATED.fetch_add(size, Ordering::Relaxed);
-            let current = old_alloc + size - DEALLOCATED.load(Ordering::Relaxed);
+        unsafe {
+            let ptr = System.alloc(layout);
+            if !ptr.is_null() {
+                let size = layout.size();
+                let old_alloc = ALLOCATED.fetch_add(size, Ordering::Relaxed);
+                let current = old_alloc + size - DEALLOCATED.load(Ordering::Relaxed);
 
-            // Update peak
-            let mut old_peak = PEAK.load(Ordering::Relaxed);
-            while current > old_peak {
-                match PEAK.compare_exchange_weak(
-                    old_peak,
-                    current,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(x) => old_peak = x,
+                // Update peak
+                let mut old_peak = PEAK.load(Ordering::Relaxed);
+                while current > old_peak {
+                    match PEAK.compare_exchange_weak(
+                        old_peak,
+                        current,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(x) => old_peak = x,
+                    }
                 }
             }
+            ptr
         }
-        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        DEALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
-        System.dealloc(ptr, layout)
+        unsafe {
+            DEALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
+            System.dealloc(ptr, layout)
+        }
     }
 }
 
@@ -63,14 +67,13 @@ struct ProfileResult {
     time_ns: u64,
     total_allocated: usize,
     peak_memory: usize,
-    iterations: usize,
 }
 
 fn profile_operation<F>(name: &str, iterations: usize, mut f: F) -> ProfileResult
 where
     F: FnMut(),
 {
-    const RUNS: usize = 50; // Run 50 times for averaging
+    const RUNS: usize = 10; // Run 100 times for averaging
 
     let mut times = Vec::with_capacity(RUNS);
     let mut allocs = Vec::with_capacity(RUNS);
@@ -107,7 +110,6 @@ where
         time_ns: times[RUNS / 2], // Median
         total_allocated: allocs[RUNS / 2],
         peak_memory: peaks[RUNS / 2],
-        iterations,
     }
 }
 

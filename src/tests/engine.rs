@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use super::{Flags, Regex};
 // --- Helper Functions ---
 
@@ -385,16 +387,16 @@ fn test_flags_verbose() {
     flags.verbose = true;
 
     // Spaces ignored
-    let re = Regex::new("foo bar", flags.clone()).unwrap();
+    let re = Regex::new("foo bar", flags).unwrap();
     assert!(re.is_match("foobar"));
     assert!(!re.is_match("foo bar"));
 
     // Escaped space matches space
-    let re = Regex::new(r"foo\ bar", flags.clone()).unwrap();
+    let re = Regex::new(r"foo\ bar", flags).unwrap();
     assert!(re.is_match("foo bar"));
 
     // Space in brackets matches space
-    let re = Regex::new(r"foo[ ]bar", flags.clone()).unwrap();
+    let re = Regex::new(r"foo[ ]bar", flags).unwrap();
     assert!(re.is_match("foo bar"));
 
     // Comments
@@ -459,6 +461,50 @@ fn test_lookbehind() {
     // Negative (?<!...)
     assert_find("(?<!foo)bar", "bazbar", "bar");
     assert_no_match("(?<!foo)bar", "foobar");
+}
+
+#[test]
+fn test_lookbehind_large_input_is_linear() {
+    // Regression guard: a bounded-length lookbehind must not rescan from the
+    // string start at every position. That naive `0..=pos` loop made lookbehind
+    // O(N^2) and hung on large buffers; it is now windowed to the inner pattern's
+    // maximum length, so a non-matching scan over a 200K-char haystack finishes
+    // near-instantly.
+    let haystack = "abcdefghij".repeat(20_000); // 200K chars, contains no 'z'
+    let re = Regex::new(r"(?<!x)zzzzznomatch", Flags::default()).unwrap();
+    let start = std::time::Instant::now();
+    assert!(re.find(&haystack).is_none());
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "lookbehind scan took {:?} - possible O(N^2) regression",
+        elapsed
+    );
+
+    // Correctness over a large input: the windowed lookbehind still matches at
+    // the right spot far from the string start.
+    let mut tail = "a".repeat(100_000);
+    tail.push_str("foobar");
+    let re2 = Regex::new(r"(?<=foo)bar", Flags::default()).unwrap();
+    let m = re2
+        .find(&tail)
+        .expect("(?<=foo)bar should match the 'bar' at the tail");
+    assert_eq!(&tail[m.start..m.end], "bar");
+}
+
+#[test]
+fn test_prefilter_sees_through_assertions() {
+    // The start prefilter keys on the first *consumed* literal even when the
+    // pattern opens with zero-width assertions. It must never cause a false
+    // negative (skip a position that actually matches).
+    assert_find(r"^bar", "bar", "bar");
+    assert_find(r"\bbar", "foo bar", "bar");
+    assert_find(r"(?<!z)bar", "  bar", "bar");
+    assert_find(r"(?<=foo)bar", "foobar", "bar");
+
+    // Smartcase: an all-lowercase literal behind an assertion still matches
+    // case-insensitively via the case-insensitive prefilter path.
+    assert_find(r"(?<!z)bar", "  BAR", "BAR");
 }
 
 #[test]
