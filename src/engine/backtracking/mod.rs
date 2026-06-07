@@ -69,12 +69,6 @@ impl<'a, H: Haystack> Matcher<'a, H> {
         let mut pos = start_index;
 
         while pos <= len {
-            // When a prefilter is available, jump straight to the next position
-            // whose first consuming character can begin a match. This skips the
-            // O(N) per-position attempt loop for patterns anchored by a literal,
-            // even when that literal is preceded by zero-width assertions such as
-            // `^`, `\b`, or a lookbehind. Without a filter we fall back to checking
-            // every character boundary.
             if has_filter {
                 match self.prefilter.find_next(&self.text, pos) {
                     Some(p) => pos = p,
@@ -153,7 +147,7 @@ impl<'a, H: Haystack> Matcher<'a, H> {
         pos: usize,
         ctx: &mut MatchContext,
         cursor: &mut H::Cursor,
-        prev_char: Option<char>, // Optimization: pass previous char to avoid potentially expensive char_before()
+        prev_char: Option<char>,
     ) -> Option<usize> {
         if nodes.is_empty() {
             return Some(pos);
@@ -249,17 +243,6 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                     if let Some(next_pos) =
                         self.match_nodes(alt, pos, &mut fork_ctx, &mut fork_cursor, prev_char)
                     {
-                        // Note: Alternation children update prev_char internally if they consume.
-                        // We must pass the correct prev_char to 'remaining'.
-                        // But wait, `next_pos` might be > `pos`, meaning we consumed chars.
-                        // We strictly need the `prev_char` AT `next_pos`.
-                        // But `match_nodes` API relies on us determining it?
-                        // If `alt` consumed chars, `fork_cursor` advanced.
-                        // We don't have direct access to the char before `fork_cursor` without backtracking or tracking return.
-                        // However, we can use `self.text.char_before(next_pos)` here. Since alternations/groups are higher level steps,
-                        // calling it once per group match is much cheaper than per character in looping.
-                        // BUT, ideally we pass it back.
-                        // For now, let's use `char_before` here as it is safer and much less frequent than the inner loop.
                         let next_prev_char = if next_pos > pos {
                             self.text.char_before(next_pos)
                         } else {
@@ -373,26 +356,14 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 nodes: look_nodes,
                 positive,
             } => {
-                // Lookbehind implementation: try matching ending at pos
-                // Lookbehind doesn't consume, so prev_char is irrelevant for the next step?
-                // But wait, inside lookbehind we match backwards or simulate it.
-                // Current impl simulates by trying all start positions ending at pos.
+                // Try inner matches ending at `pos`, stepping back over whole chars
+                // (boundary-safe) up to the lookbehind's max byte length.
+                let max_len = max_consumable_bytes(look_nodes);
                 let mut matched = false;
-                // Only start positions within the lookbehind's maximum match length
-                // can possibly end at `pos`. Bounding the scan to that window turns
-                // the naive `0..=pos` loop - which makes lookbehind O(N^2) over a full
-                // search - into O(max_len) per position. A fixed-length lookbehind such
-                // as `(?<!x)` collapses to a single candidate start. Unbounded inner
-                // patterns (containing `*`/`+`/`{n,}`/backrefs) fall back to `0`.
-                let lo = match max_consumable_bytes(look_nodes) {
-                    Some(max_len) => pos.saturating_sub(max_len),
-                    None => 0,
-                };
-                for start in lo..=pos {
+                let mut start = pos;
+                loop {
                     let mut look_ctx = ctx.clone();
                     let mut look_cursor = self.text.cursor_at(start);
-                    // For the inner match, we need prev_char at 'start'. Expensive?
-                    // Yes, but LookBehind is generally expensive.
                     let start_prev_char = if start > 0 {
                         self.text.char_before(start)
                     } else {
@@ -410,6 +381,20 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                         matched = true;
                         break;
                     }
+
+                    // Step to the previous char boundary, bounded by `max_len`.
+                    if start == 0 {
+                        break;
+                    }
+                    let prev = match self.text.char_before(start) {
+                        Some(c) => c,
+                        None => break,
+                    };
+                    let next_start = start - prev.len_utf8();
+                    if max_len.is_some_and(|limit| pos - next_start > limit) {
+                        break;
+                    }
+                    start = next_start;
                 }
 
                 if matched == *positive {
@@ -880,12 +865,6 @@ impl<'a, H: Haystack> Iterator for FindMatchesIterator<'a, H> {
 
 /// A cheap test that locates the next position where a match could *start*,
 /// letting `find_at` skip over input that provably cannot begin a match.
-///
-/// A pattern's match always begins by consuming the first non-assertion atom, so
-/// the byte at the match-start position is constrained even when the pattern opens
-/// with zero-width assertions (`^`, `\b`, lookahead/lookbehind, `\zs`). We exploit
-/// that to scan with `memchr`/`memmem` instead of attempting a full match at every
-/// position.
 #[derive(Clone, Debug)]
 pub enum Prefilter {
     /// No usable constraint - caller must try every position.
@@ -926,8 +905,6 @@ impl Prefilter {
                 if let Some(hay) = text.as_bytes_opt() {
                     find_literal_bytes(hay, bytes, *ci, pos)
                 } else {
-                    // Non-contiguous haystack: filter on the first byte only; the
-                    // full match attempt verifies the remaining bytes.
                     let first = bytes[0];
                     if *ci {
                         let up = first.to_ascii_uppercase();
@@ -1013,10 +990,6 @@ fn is_zero_width(node: &AstNode) -> bool {
 }
 
 /// Build a start prefilter from the pattern's leading nodes.
-///
-/// Leading zero-width assertions are skipped (the first *consumed* atom still pins
-/// the byte at the match-start position), then we prefer a multi-byte literal run
-/// and fall back to a single first byte.
 fn analyze_prefilter(nodes: &[AstNode], flags: &Flags) -> Prefilter {
     let ic = flags.ignore_case.unwrap_or(false);
 
@@ -1030,7 +1003,6 @@ fn analyze_prefilter(nodes: &[AstNode], flags: &Flags) -> Prefilter {
         return Prefilter::None;
     }
 
-    // Prefer a run of ASCII literals - a stronger filter than a single byte.
     let mut run: Vec<u8> = Vec::new();
     for node in nodes {
         match node {
@@ -1086,9 +1058,6 @@ fn analyze_prefilter(nodes: &[AstNode], flags: &Flags) -> Prefilter {
 /// Returns `None` when the sequence can match an unbounded amount of input
 /// (it contains `*`, `+`, an open-ended `{n,}`, or a backreference whose length
 /// is not known statically).
-///
-/// Used to window lookbehind scanning: a lookbehind that consumes at most `k`
-/// bytes only needs to test start positions in `[pos - k, pos]`.
 fn max_consumable_bytes(nodes: &[AstNode]) -> Option<usize> {
     let mut total = 0usize;
     for n in nodes {

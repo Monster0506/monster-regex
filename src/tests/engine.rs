@@ -508,6 +508,18 @@ fn test_prefilter_sees_through_assertions() {
 }
 
 #[test]
+fn test_lookbehind_non_ascii_no_panic() {
+    // Regression: the lookbehind scan stepped through raw byte offsets, slicing
+    // mid-UTF-8 (cursor_at / char_before) and panicking on non-ASCII input.
+    assert_find(r"(?<!x)b", "äb", "b");
+    assert_find(r"(?<=ä)b", "äb", "b");
+    assert_no_match(r"(?<!ä)b", "äb");
+
+    let re = Regex::new(r"(?<!x).", Flags::default()).unwrap();
+    assert_eq!(re.find_all("äöü").count(), 3);
+}
+
+#[test]
 fn test_unicode_class_no_panic_and_matches() {
     // Regression: Unicode-aware classes (`\w`, `\s`, ...) must not use an ASCII
     // byte start-filter. Doing so indexed out of bounds on UTF-8 continuation
