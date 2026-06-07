@@ -15,9 +15,6 @@ pub enum StartFilter {
     Three(u8, u8, u8),
     /// Any byte in the inclusive range [lo, hi].
     ByteRange(u8, u8),
-    /// Arbitrary ASCII class stored as a 128-bit membership table.
-    /// `mask[b >> 6] & (1 << (b & 63))` is set iff byte `b` can start a match.
-    Table128([u64; 2]),
 }
 
 impl StartFilter {
@@ -39,9 +36,6 @@ impl StartFilter {
             StartFilter::Two(b1, b2) => memchr::memchr2(*b1, *b2, sub)?,
             StartFilter::Three(b1, b2, b3) => memchr::memchr3(*b1, *b2, *b3, sub)?,
             StartFilter::ByteRange(lo, hi) => sub.iter().position(|&b| b >= *lo && b <= *hi)?,
-            StartFilter::Table128(mask) => sub
-                .iter()
-                .position(|&b| mask[(b >> 6) as usize] & (1u64 << (b & 63)) != 0)?,
         };
         Some(pos + offset)
     }
@@ -55,7 +49,6 @@ impl StartFilter {
             StartFilter::Two(b1, b2) => b == *b1 || b == *b2,
             StartFilter::Three(b1, b2, b3) => b == *b1 || b == *b2 || b == *b3,
             StartFilter::ByteRange(lo, hi) => b >= *lo && b <= *hi,
-            StartFilter::Table128(mask) => mask[(b >> 6) as usize] & (1u64 << (b & 63)) != 0,
         }
     }
 }
@@ -330,14 +323,21 @@ impl BitParallelNfa {
             return None;
         }
 
-        // Zero-width assertions make the epsilon closure position-dependent.
         for s in &nfa.states {
             match s {
+                // Zero-width assertions make the epsilon closure position-dependent.
                 State::AnchorStart(_)
                 | State::AnchorEnd(_)
                 | State::WordBoundary(_)
                 | State::WordStart(_)
                 | State::WordEnd(_) => return None,
+                // The table is keyed by single bytes (0..=255) and only populated for
+                // ASCII, so it cannot represent matching of multibyte UTF-8 chars.
+                // Bail out for any consuming state that can match a non-ASCII char;
+                // the char-based Pike VM (`read_char`) handles those correctly.
+                State::Char(c, _) if !c.is_ascii() => return None,
+                State::Any(_) => return None,
+                State::Class(class, _) if !class_is_ascii_only(class) => return None,
                 _ => {}
             }
         }
@@ -1094,6 +1094,20 @@ impl PikeVM {
 }
 
 // -- Helpers -------------------------------------------------------------------
+
+/// True if `class` only ever matches ASCII characters. The bit-parallel table is
+/// byte-keyed, so it can only represent classes that never match a multibyte char.
+fn class_is_ascii_only(class: &CharClass) -> bool {
+    use CharClass::*;
+    match class {
+        Digit | Hex | Octal | Punctuation => true,
+        Set {
+            chars,
+            negated: false,
+        } => chars.iter().all(|r| r.end.is_ascii()),
+        _ => false,
+    }
+}
 
 /// Static class check used during bit-parallel table precomputation.
 fn matches_class_static(class: &CharClass, c: char, ic: bool, dotall: bool) -> bool {

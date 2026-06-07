@@ -228,7 +228,7 @@ fn analyze_start_filter(nodes: &[AstNode], flags: &Flags) -> StartFilter {
     }
 }
 
-/// Map well-known classes to an efficient ByteRange/Table128 filter.
+/// Map a leading character class to an efficient byte start-filter.
 fn start_filter_from_class(node: &AstNode) -> Option<StartFilter> {
     let class = match node {
         AstNode::CharClass(c) => c,
@@ -241,34 +241,9 @@ fn start_filter_from_class(node: &AstNode) -> Option<StartFilter> {
         _ => return None,
     };
     match class {
-        // \d -> '0'..='9'
         CharClass::Digit => Some(StartFilter::ByteRange(b'0', b'9')),
-        // \w -> [0-9A-Za-z_] - arbitrary set, use Table128 (case-insensitivity
-        // does not change membership of this class)
-        CharClass::Word => Some(table128_for(|b: u8| {
-            let c = b as char;
-            c.is_ascii_alphanumeric() || c == '_'
-        })),
-        // \p{Alpha} / [a-zA-Z]
-        CharClass::Lowercase => Some(StartFilter::ByteRange(b'a', b'z')),
-        CharClass::Uppercase => Some(StartFilter::ByteRange(b'A', b'Z')),
-        CharClass::Alphanumeric => Some(table128_for(|b: u8| (b as char).is_ascii_alphanumeric())),
-        // Whitespace: common ASCII whitespace bytes
-        CharClass::Whitespace => Some(table128_for(|b: u8| {
-            matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C | 0x0B)
-        })),
         _ => None,
     }
-}
-
-fn table128_for(pred: impl Fn(u8) -> bool) -> StartFilter {
-    let mut mask = [0u64; 2];
-    for b in 0u8..=127u8 {
-        if pred(b) {
-            mask[(b >> 6) as usize] |= 1u64 << (b & 63);
-        }
-    }
-    StartFilter::Table128(mask)
 }
 
 // -- Literal extraction from compiled NFA --------------------------------------

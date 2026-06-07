@@ -508,6 +508,21 @@ fn test_prefilter_sees_through_assertions() {
 }
 
 #[test]
+fn test_unicode_class_no_panic_and_matches() {
+    // Regression: Unicode-aware classes (`\w`, `\s`, ...) must not use an ASCII
+    // byte start-filter. Doing so indexed out of bounds on UTF-8 continuation
+    // bytes (panic) and skipped non-ASCII matches.
+    let hay = "héllo wörld café";
+
+    let re = Regex::new_linear(r"\w+", Flags::default()).unwrap();
+    let m = re.find(hay).expect("\\w+ should match");
+    assert_eq!(&hay[m.start..m.end], "héllo");
+
+    let words: Vec<&str> = re.find_all(hay).map(|m| &hay[m.start..m.end]).collect();
+    assert_eq!(words, vec!["héllo", "wörld", "café"]);
+}
+
+#[test]
 fn test_complex_lookarounds() {
     // Lookahead with quantifier inside
     println!("1");
