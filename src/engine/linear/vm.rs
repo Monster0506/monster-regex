@@ -62,9 +62,6 @@ pub struct Literal {
     pub bytes: Box<[u8]>,
     /// If true, match case-insensitively (ASCII only).
     pub case_insensitive: bool,
-    /// Prebuilt memmem Finder (owned, 'static) so we never pay the build cost
-    /// more than once.  Used only for case-sensitive search; CI falls back to
-    /// the memchr2 + verify loop.
     pub finder: memchr::memmem::Finder<'static>,
 }
 
@@ -88,8 +85,6 @@ impl Literal {
         self.bytes.is_empty()
     }
 
-    /// Find the next occurrence of this literal in `haystack[start..]`.
-    /// Returns the absolute byte offset, or None.
     pub fn find_in(&self, haystack: &[u8], start: usize) -> Option<usize> {
         if start >= haystack.len() {
             return None;
@@ -98,54 +93,90 @@ impl Literal {
             // Case-sensitive: reuse the prebuilt SIMD Finder.
             self.finder.find(&haystack[start..]).map(|i| i + start)
         } else {
-            // Case-insensitive ASCII: memchr2 on first byte then verify rest.
-            if self.bytes.is_empty() {
-                return Some(start);
-            }
-            let first = self.bytes[0];
-            let first_upper = first.to_ascii_uppercase();
-            let mut pos = start;
-            loop {
-                if pos >= haystack.len() {
-                    return None;
-                }
-                let sub = &haystack[pos..];
-                let idx = if first != first_upper {
-                    memchr::memchr2(first, first_upper, sub)?
-                } else {
-                    memchr::memchr(first, sub)?
-                };
-                let abs = pos + idx;
-                let end = abs + self.bytes.len();
-                if end > haystack.len() {
-                    return None;
-                }
-                if haystack[abs..end]
-                    .iter()
-                    .zip(self.bytes.iter())
-                    .all(|(&tb, &pb)| tb.to_ascii_lowercase() == pb)
-                {
-                    return Some(abs);
-                }
-                pos = abs + 1;
-            }
+            self.find_in_ci(haystack, start)
         }
+    }
+
+    fn find_in_ci(&self, haystack: &[u8], start: usize) -> Option<usize> {
+        if self.bytes.is_empty() {
+            return Some(start);
+        }
+        if haystack.len().saturating_sub(start) <= CI_SMALL_THRESHOLD {
+            return naive_ci_find(haystack, &self.bytes, start);
+        }
+        let mut buf: Vec<u8> = Vec::with_capacity(CI_CHUNK + self.bytes.len());
+        ci_chunked_search(&self.finder, self.bytes.len(), haystack, start, &mut buf).map(
+            |(abs, _rel, _core_len, _chunk_base)| abs,
+        )
     }
 }
 
-// -- Literal find-all iterator ------------------------------------------------
+const CI_CHUNK: usize = 16384;
 
-/// Single-pass iterator over all non-overlapping occurrences of a literal.
-///
-/// CS path: wraps `memmem::FindIter` - a streaming SIMD searcher that processes
-/// the haystack in one pass, yielding one position per match without any per-call
-/// SIMD prologue overhead.  The Finder is pre-built in `Literal::new` and borrowed
-/// here; no allocation or build cost on `find_all`.
-///
-/// CI path: memchr2 on first byte + byte-by-byte verify (same as before).
-// The case-sensitive variant embeds a memmem `FindIter` (larger than the CI
-// variant), but this iterator is short-lived and never stored in bulk, so the
-// size difference is not worth an extra heap indirection.
+const CI_SMALL_THRESHOLD: usize = 4096;
+
+fn naive_ci_find(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    if start >= haystack.len() {
+        return None;
+    }
+    let first = needle[0];
+    let first_upper = first.to_ascii_uppercase();
+    let mut pos = start;
+    loop {
+        if pos >= haystack.len() {
+            return None;
+        }
+        let sub = &haystack[pos..];
+        let idx = if first != first_upper {
+            memchr::memchr2(first, first_upper, sub)?
+        } else {
+            memchr::memchr(first, sub)?
+        };
+        let abs = pos + idx;
+        let end = abs + needle.len();
+        if end > haystack.len() {
+            return None;
+        }
+        if haystack[abs..end]
+            .iter()
+            .zip(needle)
+            .all(|(&tb, &pb)| tb.to_ascii_lowercase() == pb)
+        {
+            return Some(abs);
+        }
+        pos = abs + 1;
+    }
+}
+
+#[inline]
+fn ci_chunked_search(
+    finder: &memchr::memmem::Finder<'static>,
+    needle_len: usize,
+    haystack: &[u8],
+    start: usize,
+    buf: &mut Vec<u8>,
+) -> Option<(usize, usize, usize, usize)> {
+    let mut chunk_base = start;
+    while chunk_base < haystack.len() {
+        let core_end = (chunk_base + CI_CHUNK).min(haystack.len());
+        let ext_end = (core_end + needle_len - 1).min(haystack.len());
+        buf.clear();
+        buf.extend(
+            haystack[chunk_base..ext_end]
+                .iter()
+                .map(u8::to_ascii_lowercase),
+        );
+        let core_len = core_end - chunk_base;
+        if let Some(rel) = finder.find(buf)
+            && rel < core_len
+        {
+            return Some((chunk_base + rel, rel, core_len, chunk_base));
+        }
+        chunk_base = core_end;
+    }
+    None
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum LiteralFindIter<'h, 'n> {
     CaseSensitive {
@@ -155,10 +186,28 @@ pub enum LiteralFindIter<'h, 'n> {
         offset: usize,
         lit_len: usize,
     },
-    CaseInsensitive {
+    /// Below `CI_SMALL_THRESHOLD` total remaining bytes: same zero-copy scan
+    /// as `naive_ci_find`, avoiding the chunked path's fixed allocation cost.
+    CaseInsensitiveSmall {
         haystack: &'h [u8],
         pos: usize,
         lit: &'n Literal,
+    },
+    CaseInsensitive {
+        haystack: &'h [u8],
+        lit: &'n Literal,
+        /// Lowercased window into `haystack[chunk_base..]`, reused across chunks
+        /// so `find_all` pays the lowercasing cost once per `CI_CHUNK` bytes
+        /// rather than once per match.
+        buf: Vec<u8>,
+        /// Absolute offset in `haystack` that `buf[0]` corresponds to.
+        chunk_base: usize,
+        /// Number of bytes at the front of `buf` that are valid match-start
+        /// positions (the rest is trailing overlap for boundary matches).
+        core_len: usize,
+        /// Next offset within `buf` to resume the `memmem` search from.
+        search_from: usize,
+        exhausted: bool,
     },
 }
 
@@ -170,11 +219,22 @@ impl<'h, 'n> LiteralFindIter<'h, 'n> {
                 offset: start,
                 lit_len: lit.len(),
             }
-        } else {
-            LiteralFindIter::CaseInsensitive {
+        } else if lit.bytes.is_empty() || haystack.len().saturating_sub(start) <= CI_SMALL_THRESHOLD
+        {
+            LiteralFindIter::CaseInsensitiveSmall {
                 haystack,
                 pos: start,
                 lit,
+            }
+        } else {
+            LiteralFindIter::CaseInsensitive {
+                haystack,
+                lit,
+                buf: Vec::new(),
+                chunk_base: start,
+                core_len: 0,
+                search_from: 0,
+                exhausted: lit.bytes.is_empty(),
             }
         }
     }
@@ -198,11 +258,56 @@ impl<'h, 'n> Iterator for LiteralFindIter<'h, 'n> {
                     end: start + *lit_len,
                 })
             }
-            LiteralFindIter::CaseInsensitive { haystack, pos, lit } => {
-                let start = lit.find_in(haystack, *pos)?;
+            LiteralFindIter::CaseInsensitiveSmall { haystack, pos, lit } => {
+                if lit.bytes.is_empty() {
+                    return None;
+                }
+                let start = naive_ci_find(haystack, &lit.bytes, *pos)?;
                 let end = start + lit.len();
                 *pos = end;
                 Some(Match { start, end })
+            }
+            LiteralFindIter::CaseInsensitive {
+                haystack,
+                lit,
+                buf,
+                chunk_base,
+                core_len,
+                search_from,
+                exhausted,
+            } => {
+                if *exhausted {
+                    return None;
+                }
+                loop {
+                    if let Some(rel) = lit.finder.find(&buf[*search_from..]) {
+                        let abs_rel = *search_from + rel;
+                        if abs_rel < *core_len {
+                            let start = *chunk_base + abs_rel;
+                            *search_from = abs_rel + lit.len();
+                            return Some(Match {
+                                start,
+                                end: start + lit.len(),
+                            });
+                        }
+                    }
+                    let next_base = *chunk_base + *core_len;
+                    if next_base >= haystack.len() {
+                        *exhausted = true;
+                        return None;
+                    }
+                    *chunk_base = next_base;
+                    let core_end = (*chunk_base + CI_CHUNK).min(haystack.len());
+                    let ext_end = (core_end + lit.len() - 1).min(haystack.len());
+                    buf.clear();
+                    buf.extend(
+                        haystack[*chunk_base..ext_end]
+                            .iter()
+                            .map(u8::to_ascii_lowercase),
+                    );
+                    *core_len = core_end - *chunk_base;
+                    *search_from = 0;
+                }
             }
         }
     }
@@ -317,7 +422,30 @@ pub struct BitParallelNfa {
 impl BitParallelNfa {
     /// Try to build a precomputed table from `nfa`. Returns `None` if the NFA
     /// has > 64 states or contains zero-width assertions (anchor / word boundary).
+    ///
+    /// Unconditionally safe for any input (ASCII or not): classes that can
+    /// match non-ASCII characters (e.g. `\w`, which is Unicode-aware by
+    /// default in this engine) and `.`/`Any` are excluded, since the table is
+    /// byte-keyed and cannot represent multibyte UTF-8 matching.
     pub fn build(nfa: &Nfa) -> Option<Self> {
+        Self::build_inner(nfa, false)
+    }
+
+    /// Like `build`, but also accepts `Any` and classes that are only
+    /// "not ASCII-only" because of their multibyte-Unicode behavior (`\w`,
+    /// `\s`, ...). The resulting table is only correct when the haystack it
+    /// is run against is verified all-ASCII first (see `find_raw`): for pure
+    /// ASCII input, Unicode-aware classification of a byte in `0..128` is
+    /// identical to ASCII classification, so the byte-keyed table (already
+    /// only ever populated for `0..=127`, see below) stays exact. Still
+    /// excludes zero-width assertions (position-dependent, unrelated to byte
+    /// encoding) and literal non-ASCII `Char` states (which simply can never
+    /// fire against ASCII-only input - a dead table entry is correct there).
+    pub fn build_ascii_gated(nfa: &Nfa) -> Option<Self> {
+        Self::build_inner(nfa, true)
+    }
+
+    fn build_inner(nfa: &Nfa, ascii_gated: bool) -> Option<Self> {
         let n = nfa.states.len();
         if n > 64 {
             return None;
@@ -336,8 +464,10 @@ impl BitParallelNfa {
                 // Bail out for any consuming state that can match a non-ASCII char;
                 // the char-based Pike VM (`read_char`) handles those correctly.
                 State::Char(c, _) if !c.is_ascii() => return None,
-                State::Any(_) => return None,
-                State::Class(class, _) if !class_is_ascii_only(class) => return None,
+                State::Any(_) if !ascii_gated => return None,
+                State::Class(class, _) if !ascii_gated && !class_is_ascii_only(class) => {
+                    return None;
+                }
                 _ => {}
             }
         }
@@ -459,43 +589,159 @@ pub struct PikeVM {
     literal: Option<Literal>,
     /// Bit-parallel NFA for fast simulation (None if NFA too large or has assertions).
     bp_nfa: Option<BitParallelNfa>,
+    /// Bit-parallel NFA valid only when the haystack is verified all-ASCII
+    /// (see `find_raw`). Populated when `bp_nfa` was disqualified solely by a
+    /// class/`.` that can match non-ASCII in general (e.g. `\w`), letting
+    /// patterns built from those still take the fast path on ASCII input.
+    bp_nfa_ascii: Option<BitParallelNfa>,
     /// UnsafeCell for zero-overhead interior mutability.
     /// SAFETY: PikeVM is used single-threaded per find operation.
     ctx: UnsafeCell<VMContext>,
     /// Persistent DFA cache: initialised once, reused across all find_from calls.
     /// SAFETY: same single-threaded guarantee as `ctx`.
     dfa_cache: UnsafeCell<LazyDfaCache>,
+    /// Memoised `is_ascii()` verdict for `bp_nfa_ascii`, keyed by the exact
+    /// `(ptr, len)` of the last haystack checked.
+    ///
+    /// `find_all` calls `find_raw` once per match against the *same*
+    /// underlying buffer (only `start_index` advances), so without this,
+    /// checking `bytes.is_ascii()` fresh on every call turns an O(n) scan
+    /// into O(n * matches) - the check re-scans from byte 0 every time,
+    /// dominating the very fast path it exists to enable.
+    ascii_cache: std::cell::Cell<(usize, usize, bool)>,
+    /// Set when every match of this pattern consumes exactly the same number
+    /// of bytes (see `fixed_length` in `mod.rs`). Licenses `find_raw_fixed_len`,
+    /// which skips per-position origin tracking entirely: with fixed length,
+    /// `start = end - fixed_len` holds for every thread that can ever reach
+    /// the accept state, so there is no leftmost-vs-longest ambiguity to
+    /// resolve by tracking *which* thread got there.
+    fixed_len: Option<usize>,
+    /// Set when the pattern is a flat concatenation of quantified
+    /// single-atom segments with provably unambiguous greedy consumption
+    /// (see `disjoint_greedy_segments` in `mod.rs`). Licenses
+    /// `find_via_segments`, which needs no NFA simulation at all - just a
+    /// per-segment greedy byte-class scan. Like `bp_nfa_ascii`, only valid
+    /// when the haystack is verified all-ASCII first.
+    segments: Option<Vec<super::Segment>>,
 }
 
 // SAFETY: find operations are inherently single-threaded.
 unsafe impl Sync for PikeVM {}
 
 impl PikeVM {
-    pub fn new(nfa: Nfa, start_filter: StartFilter, literal: Option<Literal>) -> Self {
+    pub fn new(
+        nfa: Nfa,
+        start_filter: StartFilter,
+        literal: Option<Literal>,
+        fixed_len: Option<usize>,
+        segments: Option<Vec<super::Segment>>,
+    ) -> Self {
         let num_states = nfa.states.len();
         let bp_nfa = if literal.is_none() {
             BitParallelNfa::build(&nfa)
         } else {
             None // literal path bypasses NFA entirely
         };
+        // Only worth building the ASCII-gated table when the strict one
+        // failed and there's no literal fast path already covering it.
+        let bp_nfa_ascii = if literal.is_none() && bp_nfa.is_none() {
+            BitParallelNfa::build_ascii_gated(&nfa)
+        } else {
+            None
+        };
         Self {
             nfa,
             start_filter,
             literal,
             bp_nfa,
+            bp_nfa_ascii,
             ctx: UnsafeCell::new(VMContext::new(num_states)),
             dfa_cache: UnsafeCell::new(LazyDfaCache::new()),
+            ascii_cache: std::cell::Cell::new((0, 0, false)),
+            fixed_len,
+            segments,
         }
+    }
+
+    /// `bytes.is_ascii()`, memoised by buffer identity (see `ascii_cache`).
+    #[inline]
+    fn is_ascii_cached(&self, bytes: &[u8]) -> bool {
+        let key = (bytes.as_ptr() as usize, bytes.len());
+        let (ptr, len, val) = self.ascii_cache.get();
+        if (ptr, len) == key {
+            return val;
+        }
+        let val = bytes.is_ascii();
+        self.ascii_cache.set((key.0, key.1, val));
+        val
     }
 
     pub fn find_from<H: Haystack>(&self, text: H, start_index: usize) -> Option<Match> {
         self.find_raw(text, start_index)
     }
 
+    /// The bit-parallel table applicable to `bytes` right now, if any: the
+    /// unconditionally-safe one, or the ASCII-gated one when `bytes` is
+    /// verified all-ASCII. Used to pick a streaming `find_all` strategy once
+    /// per call instead of re-deciding (and re-checking `is_ascii`) per match.
+    #[inline]
+    fn bp_table_for<'v>(&'v self, bytes: &[u8]) -> Option<&'v BitParallelNfa> {
+        if let Some(bp) = &self.bp_nfa {
+            Some(bp)
+        } else if let Some(bp) = &self.bp_nfa_ascii
+            && self.is_ascii_cached(bytes)
+        {
+            Some(bp)
+        } else {
+            None
+        }
+    }
+
+    /// Streaming find-all entry point for the bit-parallel fast path (see
+    /// `BitParallelFindAll`). Returns `None` if no bit-parallel table applies
+    /// to `bytes` right now - callers fall back to the general per-match path.
+    pub fn find_all_bitparallel<'v, 'h>(
+        &'v self,
+        bytes: &'h [u8],
+        start: usize,
+    ) -> Option<BitParallelFindAll<'v, 'h>> {
+        let bp = self.bp_table_for(bytes)?;
+        Some(BitParallelFindAll::new(self, bp, bytes, start))
+    }
+
+    /// Streaming find-all entry point for the disjoint-greedy-segments fast
+    /// path (see `find_via_segments`). Returns `None` if it doesn't apply
+    /// (no segments decomposition, or `bytes` isn't all-ASCII).
+    pub fn find_all_segments<'v, 'h>(
+        &'v self,
+        bytes: &'h [u8],
+        start: usize,
+    ) -> Option<SegmentsFindAll<'h, 'v>> {
+        let segs = self.segments.as_deref()?;
+        if !self.is_ascii_cached(bytes) {
+            return None;
+        }
+        Some(SegmentsFindAll::new(segs, bytes, start))
+    }
+
     /// Access the precomputed literal, if any.
     #[inline]
     pub fn literal(&self) -> Option<&Literal> {
         self.literal.as_ref()
+    }
+
+    /// The statically-known fixed match length, if any (see `fixed_length`).
+    #[inline]
+    pub fn fixed_len(&self) -> Option<usize> {
+        self.fixed_len
+    }
+
+    /// The disjoint-greedy-segments decomposition, if this pattern qualifies
+    /// (see `disjoint_greedy_segments`). Callers must verify the haystack is
+    /// all-ASCII before using it - same contract as `bp_nfa_ascii`.
+    #[inline]
+    pub fn segments(&self) -> Option<&[super::Segment]> {
+        self.segments.as_deref()
     }
 
     /// Returns a single-pass iterator for pure-literal patterns on contiguous bytes.
@@ -523,8 +769,37 @@ impl PikeVM {
                     end: pos + lit.len(),
                 });
             }
+            // Fixed-length fast path: no origin tracking needed at all (see
+            // `fixed_len` and `find_raw_fixed_len`). Checked before the
+            // general bit-parallel path since it's strictly cheaper whenever
+            // it applies.
+            if let Some(fixed_len) = self.fixed_len
+                && let Some(bp) = self.bp_table_for(bytes)
+            {
+                return self.find_raw_fixed_len(bp, bytes, start_index, fixed_len);
+            }
+            // Disjoint-greedy-segments fast path: no NFA/bitmask simulation
+            // at all, just a per-segment greedy byte-class scan (see
+            // `find_via_segments`). Broader than the fixed-length path above
+            // (covers variable-length patterns like `[AC]+G+[TA]+`) but
+            // still only reached when fixed-length didn't already apply.
+            if let Some(segs) = &self.segments
+                && self.is_ascii_cached(bytes)
+            {
+                return find_via_segments(segs, bytes, start_index);
+            }
             // Bit-parallel NFA: replaces add_epsilon stack with table lookups.
             if let Some(bp) = &self.bp_nfa {
+                return self.find_raw_bitparallel(bp, bytes, start_index);
+            }
+            // ASCII-gated bit-parallel NFA: same fast path for patterns using
+            // Unicode-aware classes (`\w`, `\s`, ...), valid whenever the
+            // haystack turns out to be pure ASCII. `is_ascii()` is a single
+            // SIMD-accelerated scan, far cheaper than the generic per-char
+            // PikeVM it lets us skip.
+            if let Some(bp) = &self.bp_nfa_ascii
+                && self.is_ascii_cached(bytes)
+            {
                 return self.find_raw_bitparallel(bp, bytes, start_index);
             }
             if self.start_filter.has_filter() {
@@ -534,6 +809,106 @@ impl PikeVM {
         } else {
             self.find_raw_char(text, start_index)
         }
+    }
+
+    // -- Fixed-length execution -------------------------------------------------
+
+    /// Bit-parallel scan for a pattern whose every match is exactly
+    /// `fixed_len` bytes long (see `fixed_length` in `mod.rs`). No per-position
+    /// origin tracking: since *every* thread that can ever reach the accept
+    /// state has consumed exactly `fixed_len` bytes to get there, the first
+    /// position at which the accept bit turns on is, by construction, both
+    /// the leftmost match *and* unambiguous about where it started
+    /// (`start = end - fixed_len`) - there is no "which thread got there"
+    /// question to resolve, so this returns on the very first hit.
+    #[inline(always)]
+    fn find_raw_fixed_len(
+        &self,
+        bp: &BitParallelNfa,
+        bytes: &[u8],
+        start_index: usize,
+        fixed_len: usize,
+    ) -> Option<Match> {
+        let n = bytes.len();
+        let match_mask = 1u64 << bp.match_bit;
+        let tbl = &bp.char_transitions;
+        let mut current: u64 = 0;
+        let mut pos = start_index;
+
+        // SAFETY: single-threaded per find operation (see `dfa_cache`).
+        let cache = unsafe { &mut *self.dfa_cache.get() };
+        let ck = &mut cache.keys;
+        let cb = &mut cache.byte;
+        let cv = &mut cache.val;
+
+        if self.start_filter.has_filter() {
+            match self.start_filter.find_next_from(bytes, pos) {
+                Some(p) => pos = p,
+                None => return None,
+            }
+        }
+
+        while pos <= n {
+            current |= bp.initial;
+
+            if current & match_mask != 0 {
+                return Some(Match {
+                    start: pos - fixed_len,
+                    end: pos,
+                });
+            }
+
+            if pos == n {
+                break;
+            }
+
+            let byte = bytes[pos];
+
+            let slot = (current
+                .wrapping_mul(0x9e3779b97f4a7c15)
+                .wrapping_add((byte as u64).wrapping_mul(0x517cc1b727220a95))
+                >> 54) as usize
+                & (DFA_CACHE_SIZE - 1);
+            current = if ck[slot] == current && cb[slot] == byte {
+                cv[slot]
+            } else {
+                let mut nxt = 0u64;
+                let mut active = current;
+                while active != 0 {
+                    let i = active.trailing_zeros() as usize;
+                    active &= active - 1;
+                    // SAFETY: i < n_states <= 64; byte is a valid u8 index (0-255).
+                    nxt |= unsafe { *tbl.get_unchecked(i * 256 + byte as usize) };
+                }
+                ck[slot] = current;
+                cb[slot] = byte;
+                cv[slot] = nxt;
+                nxt
+            };
+
+            pos += 1;
+
+            if current == 0 && self.start_filter.has_filter() {
+                match self.start_filter.find_next_from(bytes, pos) {
+                    Some(p) => pos = p,
+                    None => break,
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Streaming find-all entry point for the fixed-length fast path (see
+    /// `find_raw_fixed_len`). Returns `None` if it doesn't apply right now.
+    pub fn find_all_fixed_len<'v, 'h>(
+        &'v self,
+        bytes: &'h [u8],
+        start: usize,
+        fixed_len: usize,
+    ) -> Option<FixedLenFindAll<'v, 'h>> {
+        let bp = self.bp_table_for(bytes)?;
+        Some(FixedLenFindAll::new(self, bp, bytes, start, fixed_len))
     }
 
     // -- Bit-parallel execution ------------------------------------------------
@@ -650,6 +1025,17 @@ impl PikeVM {
             //    loop bodies like [AC]+ or \w+).  When next == current no state
             //    was gained or lost, so all origins are already at their minimum.
             if next != current {
+                // Snapshot pre-transition origins before mutating anything.
+                // Without this, a bit that is BOTH a target written earlier
+                // in the loop below (because a lower-numbered source feeds
+                // it) AND a source read later in the same loop (when its own
+                // turn as `i` comes up) would read its own just-written
+                // *post*-transition value instead of the pre-transition one
+                // it must contribute as a source - silently corrupting
+                // whichever downstream target it feeds, depending on bit
+                // iteration order.
+                let old_origins = origins;
+
                 // a. Reset stale values for bits that are newly active (0->1).
                 let newly = next & !current;
                 let mut nb = newly;
@@ -658,10 +1044,36 @@ impl PikeVM {
                     nb &= nb - 1;
                     origins[j] = usize::MAX;
                 }
+                // a2. A bit can also persist (stay set from `current` into
+                //     `next`) WITHOUT looping back to itself this byte - e.g.
+                //     a dead-end accepting state that a *different* source
+                //     re-targets fresh this round. Its old origin describes an
+                //     occupant that did not actually survive this step, so it
+                //     must not be allowed to win the min-compare in (b) against
+                //     a genuinely later candidate. Reset it unless state `j`
+                //     itself transitions back into `j` (a real self-loop,
+                //     where carrying the old origin forward is correct and
+                //     intended - see the `(ab)+` case below). Safe to reset
+                //     `origins[j]` here (rather than `old_origins[j]`) since
+                //     (b) below only ever reads from the untouched snapshot.
+                let persisting = next & current;
+                let mut p = persisting;
+                while p != 0 {
+                    let j = p.trailing_zeros() as usize;
+                    p &= p - 1;
+                    let self_loop =
+                        unsafe { *tbl.get_unchecked(j * 256 + byte as usize) } & (1u64 << j) != 0;
+                    if !self_loop {
+                        origins[j] = usize::MAX;
+                    }
+                }
                 // b. Propagate min origin from every source to every target in
                 //    `next`.  Must cover ALL targets (not only newly-active ones)
                 //    because back-edges (e.g. the loop in `(ab)+`) can deliver a
-                //    smaller origin to an already-active state.
+                //    smaller origin to an already-active state. Sources are read
+                //    from `old_origins` (frozen pre-transition), never from
+                //    `origins` (being written here), so iteration order over
+                //    `current`'s bits can't affect the result.
                 let mut active = current;
                 while active != 0 {
                     let i = active.trailing_zeros() as usize;
@@ -669,7 +1081,7 @@ impl PikeVM {
                     let tgt = unsafe { *tbl.get_unchecked(i * 256 + byte as usize) };
                     let tgt_in_next = tgt & next;
                     if tgt_in_next != 0 {
-                        let orig_i = origins[i];
+                        let orig_i = old_origins[i];
                         let mut t = tgt_in_next;
                         while t != 0 {
                             let j = t.trailing_zeros() as usize;
@@ -702,6 +1114,341 @@ impl PikeVM {
         best_match
     }
 
+    // -- Epsilon closure ------------------------------------------------------
+}
+
+/// Streaming `find_all` iterator for the bit-parallel fast path.
+///
+/// `find_all` needs one match at a time, but the general-purpose path gets
+/// there by calling the single-match matcher fresh for every match found -
+/// each call re-derives which fast path applies, re-checks the start filter,
+/// and (before this type existed) re-zeroed a 64-entry origins array. For
+/// patterns with dense matches (e.g. a match every few bytes) that fixed
+/// per-call cost, paid thousands of times, dominated the actual per-byte
+/// scanning work it was wrapping.
+///
+/// This iterator instead runs the exact same leftmost-longest thread
+/// simulation as `find_raw_bitparallel`, but keeps `origins` as iterator
+/// state reused across matches instead of a fresh array per match. This is
+/// sound because `origins[i]` is only ever read while bit `i` is active in
+/// `current`/`next` *within the search for the current match* - and any such
+/// bit was necessarily assigned a fresh value earlier in that same search
+/// (via the initial spawn step or the newly-active transfer step below), so
+/// leftover values from a previous match's search are never observed.
+pub struct BitParallelFindAll<'v, 'h> {
+    vm: &'v PikeVM,
+    bp: &'v BitParallelNfa,
+    bytes: &'h [u8],
+    /// Resume position for the next match search (`m.end.max(m.start + 1)`
+    /// of the last yielded match, or the initial `start`).
+    pos: usize,
+    origins: [usize; 64],
+    exhausted: bool,
+}
+
+impl<'v, 'h> BitParallelFindAll<'v, 'h> {
+    fn new(vm: &'v PikeVM, bp: &'v BitParallelNfa, bytes: &'h [u8], start: usize) -> Self {
+        Self {
+            vm,
+            bp,
+            bytes,
+            pos: start,
+            origins: [0; 64],
+            exhausted: false,
+        }
+    }
+}
+
+impl<'v, 'h> Iterator for BitParallelFindAll<'v, 'h> {
+    type Item = Match;
+
+    fn next(&mut self) -> Option<Match> {
+        if self.exhausted {
+            return None;
+        }
+
+        let bp = self.bp;
+        let bytes = self.bytes;
+        let n = bytes.len();
+        let match_mask = 1u64 << bp.match_bit;
+        let tbl = &bp.char_transitions;
+        let mut best_match: Option<Match> = None;
+        let mut current: u64 = 0;
+        let mut pos = self.pos;
+
+        // SAFETY: single-threaded per find operation (see `PikeVM::dfa_cache`).
+        let cache = unsafe { &mut *self.vm.dfa_cache.get() };
+        let ck = &mut cache.keys;
+        let cb = &mut cache.byte;
+        let cv = &mut cache.val;
+
+        let start_filter = &self.vm.start_filter;
+        if start_filter.has_filter() {
+            match start_filter.find_next_from(bytes, pos) {
+                Some(p) => pos = p,
+                None => {
+                    self.exhausted = true;
+                    return None;
+                }
+            }
+        }
+
+        while pos <= n {
+            let spawn_ok = best_match.as_ref().is_none_or(|m| pos <= m.start);
+            if spawn_ok {
+                let new_bits = bp.initial & !current;
+                if new_bits != 0 {
+                    current |= bp.initial;
+                    let mut b = new_bits;
+                    while b != 0 {
+                        let i = b.trailing_zeros() as usize;
+                        b &= b - 1;
+                        self.origins[i] = pos;
+                    }
+                }
+            }
+
+            if current & match_mask != 0 {
+                let m = Match {
+                    start: self.origins[bp.match_bit],
+                    end: pos,
+                };
+                let replace = best_match
+                    .as_ref()
+                    .is_none_or(|e| m.start < e.start || (m.start == e.start && m.end > e.end));
+                if replace {
+                    best_match = Some(m);
+                }
+            }
+
+            if pos == n {
+                break;
+            }
+
+            let byte = bytes[pos];
+
+            let slot = (current
+                .wrapping_mul(0x9e3779b97f4a7c15)
+                .wrapping_add((byte as u64).wrapping_mul(0x517cc1b727220a95))
+                >> 54) as usize
+                & (DFA_CACHE_SIZE - 1);
+            let next = if ck[slot] == current && cb[slot] == byte {
+                cv[slot]
+            } else {
+                let mut nxt = 0u64;
+                let mut active = current;
+                while active != 0 {
+                    let i = active.trailing_zeros() as usize;
+                    active &= active - 1;
+                    // SAFETY: i < n_states <= 64; byte is a valid u8 index (0-255).
+                    nxt |= unsafe { *tbl.get_unchecked(i * 256 + byte as usize) };
+                }
+                ck[slot] = current;
+                cb[slot] = byte;
+                cv[slot] = nxt;
+                nxt
+            };
+
+            if next != current {
+                // See the matching comment in `find_raw_bitparallel`: snapshot
+                // pre-transition origins before mutating anything, so a bit
+                // written as a target earlier in the loop below (by a
+                // lower-numbered source) can't corrupt its own value when it
+                // is later read as a source (when its turn as `i` comes up).
+                let old_origins = self.origins;
+
+                let newly = next & !current;
+                let mut nb = newly;
+                while nb != 0 {
+                    let j = nb.trailing_zeros() as usize;
+                    nb &= nb - 1;
+                    self.origins[j] = usize::MAX;
+                }
+                // A bit that persists into `next` without a genuine self-loop
+                // this byte must not have its stale origin win the
+                // min-compare below against a later, genuinely-fresh
+                // candidate that reaches this state index via another source.
+                let persisting = next & current;
+                let mut p = persisting;
+                while p != 0 {
+                    let j = p.trailing_zeros() as usize;
+                    p &= p - 1;
+                    let self_loop =
+                        unsafe { *tbl.get_unchecked(j * 256 + byte as usize) } & (1u64 << j) != 0;
+                    if !self_loop {
+                        self.origins[j] = usize::MAX;
+                    }
+                }
+                let mut active = current;
+                while active != 0 {
+                    let i = active.trailing_zeros() as usize;
+                    active &= active - 1;
+                    let tgt = unsafe { *tbl.get_unchecked(i * 256 + byte as usize) };
+                    let tgt_in_next = tgt & next;
+                    if tgt_in_next != 0 {
+                        let orig_i = old_origins[i];
+                        let mut t = tgt_in_next;
+                        while t != 0 {
+                            let j = t.trailing_zeros() as usize;
+                            t &= t - 1;
+                            if orig_i < self.origins[j] {
+                                self.origins[j] = orig_i;
+                            }
+                        }
+                    }
+                }
+            }
+
+            current = next;
+
+            if best_match.is_some() && current == 0 {
+                break;
+            }
+
+            pos += 1;
+
+            if current == 0 && start_filter.has_filter() {
+                match start_filter.find_next_from(bytes, pos) {
+                    Some(p) => pos = p,
+                    None => break,
+                }
+            }
+        }
+
+        match best_match {
+            Some(m) => {
+                self.pos = m.end.max(m.start + 1);
+                Some(m)
+            }
+            None => {
+                self.exhausted = true;
+                None
+            }
+        }
+    }
+}
+
+/// Streaming `find_all` iterator for the fixed-length fast path (see
+/// `PikeVM::find_raw_fixed_len`). No origin array at all - fixed length means
+/// `start = end - fixed_len` unconditionally, so there is nothing to track
+/// across bytes beyond the current bitmask itself.
+pub struct FixedLenFindAll<'v, 'h> {
+    vm: &'v PikeVM,
+    bp: &'v BitParallelNfa,
+    bytes: &'h [u8],
+    fixed_len: usize,
+    pos: usize,
+    exhausted: bool,
+}
+
+impl<'v, 'h> FixedLenFindAll<'v, 'h> {
+    fn new(
+        vm: &'v PikeVM,
+        bp: &'v BitParallelNfa,
+        bytes: &'h [u8],
+        start: usize,
+        fixed_len: usize,
+    ) -> Self {
+        Self {
+            vm,
+            bp,
+            bytes,
+            fixed_len,
+            pos: start,
+            exhausted: false,
+        }
+    }
+}
+
+impl<'v, 'h> Iterator for FixedLenFindAll<'v, 'h> {
+    type Item = Match;
+
+    fn next(&mut self) -> Option<Match> {
+        if self.exhausted {
+            return None;
+        }
+
+        let bp = self.bp;
+        let bytes = self.bytes;
+        let n = bytes.len();
+        let match_mask = 1u64 << bp.match_bit;
+        let tbl = &bp.char_transitions;
+        let mut current: u64 = 0;
+        let mut pos = self.pos;
+
+        // SAFETY: single-threaded per find operation (see `PikeVM::dfa_cache`).
+        let cache = unsafe { &mut *self.vm.dfa_cache.get() };
+        let ck = &mut cache.keys;
+        let cb = &mut cache.byte;
+        let cv = &mut cache.val;
+
+        let start_filter = &self.vm.start_filter;
+        if start_filter.has_filter() {
+            match start_filter.find_next_from(bytes, pos) {
+                Some(p) => pos = p,
+                None => {
+                    self.exhausted = true;
+                    return None;
+                }
+            }
+        }
+
+        while pos <= n {
+            current |= bp.initial;
+
+            if current & match_mask != 0 {
+                let m = Match {
+                    start: pos - self.fixed_len,
+                    end: pos,
+                };
+                self.pos = m.end.max(m.start + 1);
+                return Some(m);
+            }
+
+            if pos == n {
+                break;
+            }
+
+            let byte = bytes[pos];
+
+            let slot = (current
+                .wrapping_mul(0x9e3779b97f4a7c15)
+                .wrapping_add((byte as u64).wrapping_mul(0x517cc1b727220a95))
+                >> 54) as usize
+                & (DFA_CACHE_SIZE - 1);
+            current = if ck[slot] == current && cb[slot] == byte {
+                cv[slot]
+            } else {
+                let mut nxt = 0u64;
+                let mut active = current;
+                while active != 0 {
+                    let i = active.trailing_zeros() as usize;
+                    active &= active - 1;
+                    // SAFETY: i < n_states <= 64; byte is a valid u8 index (0-255).
+                    nxt |= unsafe { *tbl.get_unchecked(i * 256 + byte as usize) };
+                }
+                ck[slot] = current;
+                cb[slot] = byte;
+                cv[slot] = nxt;
+                nxt
+            };
+
+            pos += 1;
+
+            if current == 0 && start_filter.has_filter() {
+                match start_filter.find_next_from(bytes, pos) {
+                    Some(p) => pos = p,
+                    None => break,
+                }
+            }
+        }
+
+        self.exhausted = true;
+        None
+    }
+}
+
+impl PikeVM {
     // -- Epsilon closure -------------------------------------------------------
 
     /// Add `state_id` (and all epsilon-reachable states) into `list`.
@@ -1093,6 +1840,114 @@ impl PikeVM {
     }
 }
 
+// -- Disjoint-greedy-segments execution ----------------------------------------
+
+/// Match `segs` starting exactly at `start`, consuming each segment greedily
+/// (up to its `max`), requiring at least `min`. Under the disjointness
+/// invariant `disjoint_greedy_segments` verified at compile time, this is the
+/// *only* possible decomposition: if it fails, no decomposition starting at
+/// `start` exists at all, so there is nothing to backtrack into.
+#[inline]
+fn match_segments_from(segs: &[super::Segment], bytes: &[u8], start: usize) -> Option<usize> {
+    let n = bytes.len();
+    let mut pos = start;
+    for seg in segs {
+        let mut count = 0usize;
+        while count < seg.max && pos + count < n && seg.alphabet.contains(bytes[pos + count]) {
+            count += 1;
+        }
+        if count < seg.min {
+            return None;
+        }
+        pos += count;
+    }
+    Some(pos)
+}
+
+/// Length of the greedy run of `alphabet`-matching bytes starting at `pos`.
+#[inline]
+fn greedy_run_len(bytes: &[u8], pos: usize, alphabet: &super::SegBits) -> usize {
+    let n = bytes.len();
+    let mut count = 0usize;
+    while pos + count < n && alphabet.contains(bytes[pos + count]) {
+        count += 1;
+    }
+    count
+}
+
+/// Find the leftmost match of `segs` starting at or after `start_index`.
+///
+/// Scans candidate starts left to right, verifying each via
+/// `match_segments_from`. On failure, if the first segment is unbounded
+/// (`max == usize::MAX`), every start within the current run of its alphabet
+/// fails identically - greedy consumption always eats the whole run
+/// regardless of where within it you start, so they all hit the exact same
+/// downstream wall - so the whole run is skipped in one step rather than
+/// retried byte by byte.
+fn find_via_segments(segs: &[super::Segment], bytes: &[u8], start_index: usize) -> Option<Match> {
+    let n = bytes.len();
+    let mut pos = start_index;
+    let first = &segs[0];
+    while pos <= n {
+        if first.min >= 1 {
+            match bytes[pos..].iter().position(|&b| first.alphabet.contains(b)) {
+                Some(off) => pos += off,
+                None => return None,
+            }
+        }
+        match match_segments_from(segs, bytes, pos) {
+            Some(end) => return Some(Match { start: pos, end }),
+            None => {
+                if first.max == usize::MAX {
+                    pos += greedy_run_len(bytes, pos, &first.alphabet).max(1);
+                } else {
+                    pos += 1;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Streaming `find_all` iterator for the disjoint-greedy-segments fast path.
+pub struct SegmentsFindAll<'h, 's> {
+    segs: &'s [super::Segment],
+    bytes: &'h [u8],
+    pos: usize,
+    exhausted: bool,
+}
+
+impl<'h, 's> SegmentsFindAll<'h, 's> {
+    fn new(segs: &'s [super::Segment], bytes: &'h [u8], start: usize) -> Self {
+        Self {
+            segs,
+            bytes,
+            pos: start,
+            exhausted: false,
+        }
+    }
+}
+
+impl<'h, 's> Iterator for SegmentsFindAll<'h, 's> {
+    type Item = Match;
+
+    fn next(&mut self) -> Option<Match> {
+        if self.exhausted {
+            return None;
+        }
+        match find_via_segments(self.segs, self.bytes, self.pos) {
+            Some(m) => {
+                self.pos = m.end.max(m.start + 1);
+                Some(m)
+            }
+            None => {
+                self.exhausted = true;
+                None
+            }
+        }
+    }
+}
+
 // -- Helpers -------------------------------------------------------------------
 
 /// True if `class` only ever matches ASCII characters. The bit-parallel table is
@@ -1110,7 +1965,7 @@ fn class_is_ascii_only(class: &CharClass) -> bool {
 }
 
 /// Static class check used during bit-parallel table precomputation.
-fn matches_class_static(class: &CharClass, c: char, ic: bool, dotall: bool) -> bool {
+pub(crate) fn matches_class_static(class: &CharClass, c: char, ic: bool, dotall: bool) -> bool {
     use CharClass::*;
     match class {
         Digit => c.is_ascii_digit(),

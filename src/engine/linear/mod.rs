@@ -99,6 +99,17 @@ impl LinearRegex {
                 return LinearFindAll::LiteralCI(iter);
             }
         }
+        if let Some(fixed_len) = self.vm.fixed_len()
+            && let Some(iter) = self.vm.find_all_fixed_len(text.as_bytes(), 0, fixed_len)
+        {
+            return LinearFindAll::FixedLen(iter);
+        }
+        if let Some(iter) = self.vm.find_all_segments(text.as_bytes(), 0) {
+            return LinearFindAll::Segments(iter);
+        }
+        if let Some(iter) = self.vm.find_all_bitparallel(text.as_bytes(), 0) {
+            return LinearFindAll::BitParallel(iter);
+        }
         LinearFindAll::Nfa(FindMatchesIterator {
             text,
             regex: self,
@@ -107,7 +118,6 @@ impl LinearRegex {
     }
 
     pub fn new(pattern: &str, mut flags: Flags) -> Result<Self, CompileError> {
-        // Smartcase: all-lowercase pattern -> case-insensitive
         if flags.ignore_case.is_none() {
             let has_uppercase = pattern.chars().any(|c| c.is_uppercase());
             flags.ignore_case = Some(!has_uppercase);
@@ -121,14 +131,15 @@ impl LinearRegex {
         let (group_count, named_groups) = analyze_captures(&ast);
 
         let start_filter = analyze_start_filter(&ast, &flags);
+        let fixed_len = fixed_length(&ast);
+        let segments = disjoint_greedy_segments(&ast, &flags);
 
         let compiler = Compiler::new(flags);
         let nfa = compiler.compile(&ast)?;
 
-        // Try to extract a pure literal from the compiled NFA (bypasses simulation).
         let literal = extract_literal(&nfa);
 
-        let vm = PikeVM::new(nfa, start_filter, literal);
+        let vm = PikeVM::new(nfa, start_filter, literal, fixed_len, segments);
 
         Ok(LinearRegex {
             vm,
@@ -140,9 +151,154 @@ impl LinearRegex {
     }
 }
 
-// -- Start-filter analysis ------------------------------------------------------
+fn fixed_length(nodes: &[AstNode]) -> Option<usize> {
+    nodes.iter().try_fold(0usize, |acc, n| {
+        Some(acc + fixed_length_node(n)?)
+    })
+}
 
-/// Collect possible start bytes from an AST node (up to 3; returns empty if too many).
+fn fixed_length_node(node: &AstNode) -> Option<usize> {
+    match node {
+        AstNode::Literal(_) | AstNode::CharClass(_) => Some(1),
+        AstNode::Exact { node, count } => Some(fixed_length_node(node)? * count),
+        AstNode::Range {
+            node,
+            min,
+            max: Some(max),
+            ..
+        } if min == max => Some(fixed_length_node(node)? * min),
+        AstNode::Group { nodes, .. } => fixed_length(nodes),
+        AstNode::Alternation(alts) => {
+            let mut lens = alts.iter().map(|alt| fixed_length(alt));
+            let first = lens.next()??;
+            lens.all(|l| l == Some(first)).then_some(first)
+        }
+        AstNode::ZeroOrMore { .. }
+        | AstNode::OneOrMore { .. }
+        | AstNode::Optional { .. }
+        | AstNode::Range { .. }
+        | AstNode::StartAnchor
+        | AstNode::EndAnchor
+        | AstNode::WordBoundary
+        | AstNode::StartWord
+        | AstNode::EndWord
+        | AstNode::SetMatchStart
+        | AstNode::SetMatchEnd
+        | AstNode::Backref(_)
+        | AstNode::LookAhead { .. }
+        | AstNode::LookBehind { .. } => None,
+    }
+}
+
+/// A 256-bit set of bytes, used as a quantified atom's alphabet.
+#[derive(Clone, Copy, Debug)]
+pub struct SegBits([u64; 4]);
+
+impl SegBits {
+    fn empty() -> Self {
+        SegBits([0; 4])
+    }
+    fn set(&mut self, b: u8) {
+        self.0[(b / 64) as usize] |= 1u64 << (b % 64);
+    }
+    #[inline]
+    pub fn contains(&self, b: u8) -> bool {
+        (self.0[(b / 64) as usize] >> (b % 64)) & 1 != 0
+    }
+    fn disjoint(&self, other: &SegBits) -> bool {
+        self.0.iter().zip(other.0.iter()).all(|(a, b)| a & b == 0)
+    }
+    fn union(&self, other: &SegBits) -> SegBits {
+        let mut r = [0u64; 4];
+        for i in 0..4 {
+            r[i] = self.0[i] | other.0[i];
+        }
+        SegBits(r)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Segment {
+    pub alphabet: SegBits,
+    pub min: usize,
+    pub max: usize,
+}
+
+fn atom_alphabet(node: &AstNode, ic: bool, dotall: bool) -> Option<SegBits> {
+    match node {
+        AstNode::Literal(c) => {
+            if !c.is_ascii() {
+                return None;
+            }
+            let mut s = SegBits::empty();
+            let b = *c as u8;
+            if ic {
+                s.set(b.to_ascii_lowercase());
+                s.set(b.to_ascii_uppercase());
+            } else {
+                s.set(b);
+            }
+            Some(s)
+        }
+        AstNode::CharClass(cls) => {
+            let mut s = SegBits::empty();
+            for byte in 0u8..=127u8 {
+                if vm::matches_class_static(cls, byte as char, ic, dotall) {
+                    s.set(byte);
+                }
+            }
+            Some(s)
+        }
+        _ => None,
+    }
+}
+
+fn disjoint_greedy_segments(nodes: &[AstNode], flags: &Flags) -> Option<Vec<Segment>> {
+    if nodes.is_empty() {
+        return None;
+    }
+    let ic = flags.ignore_case.unwrap_or(false);
+    let dotall = flags.dotall;
+    let mut segs = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let (inner, min, max, greedy): (&AstNode, usize, usize, bool) = match node {
+            AstNode::Literal(_) | AstNode::CharClass(_) => (node, 1, 1, true),
+            AstNode::OneOrMore { node, greedy } => (node.as_ref(), 1, usize::MAX, *greedy),
+            AstNode::ZeroOrMore { node, greedy } => (node.as_ref(), 0, usize::MAX, *greedy),
+            AstNode::Optional { node, greedy } => (node.as_ref(), 0, 1, *greedy),
+            AstNode::Exact { node, count } => (node.as_ref(), *count, *count, true),
+            AstNode::Range {
+                node,
+                min,
+                max,
+                greedy,
+            } => (node.as_ref(), *min, max.unwrap_or(usize::MAX), *greedy),
+            _ => return None,
+        };
+        if !greedy {
+            return None;
+        }
+        let alphabet = atom_alphabet(inner, ic, dotall)?;
+        segs.push(Segment { alphabet, min, max });
+    }
+
+    let mut reachable = SegBits::empty();
+    let mut reachable_active = false;
+    for seg in &segs {
+        if reachable_active && !seg.alphabet.disjoint(&reachable) {
+            return None;
+        }
+        reachable = if seg.min == 0 && reachable_active {
+            reachable.union(&seg.alphabet)
+        } else {
+            seg.alphabet
+        };
+        reachable_active = true;
+    }
+
+    Some(segs)
+}
+
 fn collect_start_bytes(node: &AstNode, ic: bool) -> Vec<u8> {
     match node {
         AstNode::Literal(c) => {
@@ -246,10 +402,6 @@ fn start_filter_from_class(node: &AstNode) -> Option<StartFilter> {
     }
 }
 
-// -- Literal extraction from compiled NFA --------------------------------------
-
-/// Walk the NFA from its start state. If the entire pattern is a chain of
-/// Char/Class-single-char states ending in Match, extract as a Literal.
 fn extract_literal(nfa: &Nfa) -> Option<Literal> {
     let mut pos = nfa.start;
     let mut bytes: Vec<u8> = Vec::new();
@@ -292,8 +444,6 @@ fn extract_literal(nfa: &Nfa) -> Option<Literal> {
     None
 }
 
-/// If a `Set` represents exactly one ASCII character (case-sensitive or case pair),
-/// return `(lowercase_byte, is_case_insensitive)`.
 fn single_char_from_set(chars: &[CharRange]) -> Option<(u8, bool)> {
     match chars.len() {
         1 => {
@@ -324,8 +474,6 @@ fn single_char_from_set(chars: &[CharRange]) -> Option<(u8, bool)> {
     }
 }
 
-// -- CompiledRegex impl ---------------------------------------------------------
-
 impl CompiledRegex for LinearRegex {
     fn pattern(&self) -> &str {
         &self.pattern
@@ -344,8 +492,18 @@ impl CompiledRegex for LinearRegex {
     }
 
     fn find_all<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = Match> + 'a> {
-        // Fast path: pure literal - single-pass memmem scan (avoids 80K NFA restarts).
         if let Some(iter) = self.vm.literal_find_all(text.as_bytes(), 0) {
+            return Box::new(iter);
+        }
+        if let Some(fixed_len) = self.vm.fixed_len()
+            && let Some(iter) = self.vm.find_all_fixed_len(text.as_bytes(), 0, fixed_len)
+        {
+            return Box::new(iter);
+        }
+        if let Some(iter) = self.vm.find_all_segments(text.as_bytes(), 0) {
+            return Box::new(iter);
+        }
+        if let Some(iter) = self.vm.find_all_bitparallel(text.as_bytes(), 0) {
             return Box::new(iter);
         }
         Box::new(FindMatchesIterator {
@@ -422,19 +580,15 @@ impl crate::engine::CompiledRegexHaystack for LinearRegex {
     }
 }
 
-// -- Concrete find-all iterator (no Box, no vtable) ----------------------------
-
-/// Stack-allocated iterator returned by `Regex<LinearRegexEngine>::find_all`.
-///
-/// `Literal`: one `memmem::FindIter` streams the whole haystack - no heap
-/// allocation, no vtable dispatch, one enum-dispatch branch per match.
-/// `Nfa`: falls back to per-match `find_from_at`.
 pub enum LinearFindAll<'a> {
     Literal {
         inner: memchr::memmem::FindIter<'a, 'a>,
         lit_len: usize,
     },
     LiteralCI(vm::LiteralFindIter<'a, 'a>),
+    FixedLen(vm::FixedLenFindAll<'a, 'a>),
+    Segments(vm::SegmentsFindAll<'a, 'a>),
+    BitParallel(vm::BitParallelFindAll<'a, 'a>),
     Nfa(FindMatchesIterator<'a, &'a str>),
 }
 
@@ -452,12 +606,13 @@ impl<'a> Iterator for LinearFindAll<'a> {
                 })
             }
             Self::LiteralCI(it) => it.next(),
+            Self::FixedLen(it) => it.next(),
+            Self::Segments(it) => it.next(),
+            Self::BitParallel(it) => it.next(),
             Self::Nfa(it) => it.next(),
         }
     }
 }
-
-// -- Iterators ------------------------------------------------------------------
 
 pub struct FindMatchesIterator<'a, H: Haystack> {
     pub(crate) text: H,

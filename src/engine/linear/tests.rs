@@ -15,7 +15,7 @@ mod tests {
         let compiler = Compiler::new(flags);
         let nfa = compiler.compile(&ast).expect("Compile failed");
 
-        let vm = PikeVM::new(nfa, StartFilter::None, None);
+        let vm = PikeVM::new(nfa, StartFilter::None, None, None, None);
         let m = vm.find_from(text, 0)?;
         Some((m.start, m.end))
     }
@@ -27,7 +27,7 @@ mod tests {
         let compiler = Compiler::new(flags);
         let nfa = compiler.compile(&ast).expect("Compile failed");
 
-        let vm = PikeVM::new(nfa, StartFilter::None, None);
+        let vm = PikeVM::new(nfa, StartFilter::None, None, None, None);
         let m = vm.find_from(text, 0)?;
         Some((m.start, m.end))
     }
@@ -211,7 +211,7 @@ mod tests {
         let compiler = Compiler::new(flags);
         let nfa = compiler.compile(&ast).expect("Compile failed");
 
-        let vm = PikeVM::new(nfa, StartFilter::None, None);
+        let vm = PikeVM::new(nfa, StartFilter::None, None, None, None);
         let m = vm.find_from(haystack, 0).expect("Match not found");
 
         // b at index 1, c at 2, d at 3 (start of second chunk)
