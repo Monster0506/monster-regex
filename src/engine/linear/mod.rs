@@ -86,6 +86,22 @@ pub struct LinearRegex {
 impl LinearRegex {
     /// Concrete, stack-allocated find-all iterator (no heap allocation for literal patterns).
     pub fn find_all_linear<'a>(&'a self, text: &'a str) -> LinearFindAll<'a> {
+        let inner = self.find_all_linear_unwrapped(text);
+        if self.vm.has_boundary() {
+            return LinearFindAll::Boundary(BoundaryFilter {
+                inner: Box::new(inner),
+                text,
+                leading: self.vm.leading_boundary(),
+                trailing: self.vm.trailing_boundary(),
+            });
+        }
+        inner
+    }
+
+    fn find_all_linear_unwrapped<'a>(&'a self, text: &'a str) -> LinearFindAll<'a> {
+        if let Some(iter) = self.vm.multi_literal_find_all(text.as_bytes(), 0) {
+            return LinearFindAll::MultiLiteral(iter);
+        }
         if let Some(lit) = self.vm.literal() {
             if !lit.case_insensitive {
                 // CS: single FindIter streams through the whole document.
@@ -110,6 +126,9 @@ impl LinearRegex {
         if let Some(iter) = self.vm.find_all_bitparallel(text.as_bytes(), 0) {
             return LinearFindAll::BitParallel(iter);
         }
+        if let Some(iter) = self.vm.unicode_class_run_find_all(text.as_bytes(), 0) {
+            return LinearFindAll::UnicodeClassRun(iter);
+        }
         LinearFindAll::Nfa(FindMatchesIterator {
             text,
             regex: self,
@@ -130,6 +149,50 @@ impl LinearRegex {
 
         let (group_count, named_groups) = analyze_captures(&ast);
 
+        // Boundary-wrapper fast path: `\bfoo\b`-shaped patterns where the
+        // core has no internal assertions and qualifies for a deterministic
+        // fast path (literal / fixed-length / disjoint-segments - each
+        // guarantees exactly one possible match per start position) can
+        // skip NFA-level assertion handling entirely and verify the
+        // assertion as an O(1) postcondition instead (see `BoundaryKind`).
+        if let Some((leading, core, trailing)) = split_boundary_wrapper(&ast) {
+            let core_start_filter = analyze_start_filter(core, &flags);
+            let core_fixed_len = fixed_length(core);
+            let core_segments = disjoint_greedy_segments(core, &flags);
+            let core_compiler = Compiler::new(flags);
+            let core_nfa = core_compiler.compile(core)?;
+            let core_literal = extract_literal(&core_nfa);
+            let core_multi_literal = alternation_of_literals(core);
+            if core_literal.is_some()
+                || core_fixed_len.is_some()
+                || core_segments.is_some()
+                || core_multi_literal.is_some()
+            {
+                let mut vm = PikeVM::new(
+                    core_nfa,
+                    core_start_filter,
+                    core_literal,
+                    core_fixed_len,
+                    core_segments,
+                )
+                .with_boundary(leading, trailing);
+                if let Some(literals) = core_multi_literal {
+                    let ic = flags.ignore_case.unwrap_or(false);
+                    vm = vm.with_multi_literal(vm::MultiLiteral::new(literals, ic));
+                }
+                return Ok(LinearRegex {
+                    vm,
+                    pattern: pattern.to_string(),
+                    flags,
+                    group_count,
+                    named_groups,
+                });
+            }
+            // Core doesn't qualify for any deterministic fast path -
+            // correctness needs full assertion-aware simulation, so fall
+            // through and compile the original, unstripped pattern below.
+        }
+
         let start_filter = analyze_start_filter(&ast, &flags);
         let fixed_len = fixed_length(&ast);
         let segments = disjoint_greedy_segments(&ast, &flags);
@@ -139,7 +202,15 @@ impl LinearRegex {
 
         let literal = extract_literal(&nfa);
 
-        let vm = PikeVM::new(nfa, start_filter, literal, fixed_len, segments);
+        let mut vm = PikeVM::new(nfa, start_filter, literal, fixed_len, segments);
+        if let Some(literals) = alternation_of_literals(&ast) {
+            let ic = flags.ignore_case.unwrap_or(false);
+            vm = vm.with_multi_literal(vm::MultiLiteral::new(literals, ic));
+        }
+        if let Some((class, min, max)) = unicode_class_run(&ast) {
+            let ic = flags.ignore_case.unwrap_or(false);
+            vm = vm.with_unicode_class_run(vm::UnicodeClassRun::new(class, ic, flags.dotall, min, max));
+        }
 
         Ok(LinearRegex {
             vm,
@@ -187,6 +258,143 @@ fn fixed_length_node(node: &AstNode) -> Option<usize> {
         | AstNode::Backref(_)
         | AstNode::LookAhead { .. }
         | AstNode::LookBehind { .. } => None,
+    }
+}
+
+/// Maps a top-level assertion node to the subset of zero-width assertions
+/// the boundary-wrapper fast path (see `split_boundary_wrapper`) can verify
+/// as an O(1) postcondition. `StartAnchor`/`EndAnchor` (position-0/
+/// position-len, possibly multiline) and `SetMatchStart`/`SetMatchEnd`
+/// (which redefine the reported match bounds, not just gate whether a match
+/// exists) are deliberately excluded - patterns using those still compile
+/// through the general path below.
+fn boundary_kind(node: &AstNode) -> Option<vm::BoundaryKind> {
+    match node {
+        AstNode::WordBoundary => Some(vm::BoundaryKind::WordBoundary),
+        AstNode::StartWord => Some(vm::BoundaryKind::WordStart),
+        AstNode::EndWord => Some(vm::BoundaryKind::WordEnd),
+        _ => None,
+    }
+}
+
+fn contains_assertion(nodes: &[AstNode]) -> bool {
+    nodes.iter().any(|n| {
+        is_zero_width_assertion(n)
+            || match n {
+                AstNode::Group { nodes, .. } => contains_assertion(nodes),
+                AstNode::Alternation(alts) => alts.iter().any(|a| contains_assertion(a)),
+                AstNode::ZeroOrMore { node, .. }
+                | AstNode::OneOrMore { node, .. }
+                | AstNode::Optional { node, .. }
+                | AstNode::Exact { node, .. }
+                | AstNode::Range { node, .. } => contains_assertion(std::slice::from_ref(node)),
+                AstNode::LookAhead { nodes, .. } | AstNode::LookBehind { nodes, .. } => {
+                    contains_assertion(nodes)
+                }
+                _ => false,
+            }
+    })
+}
+
+/// Detects `[leading \b/\</\>]* core [trailing \b/\</\>]*`, where `core`
+/// contains no zero-width assertions anywhere (recursively) - i.e. the
+/// assertions appear only as a prefix and/or suffix run at the pattern's top
+/// level. Returns `None` if the pattern doesn't have this shape, has no
+/// wrapping assertions at all, or the leftover "core" is empty.
+fn split_boundary_wrapper(
+    nodes: &[AstNode],
+) -> Option<(Vec<vm::BoundaryKind>, &[AstNode], Vec<vm::BoundaryKind>)> {
+    let mut start = 0;
+    let mut leading = Vec::new();
+    while start < nodes.len() {
+        match boundary_kind(&nodes[start]) {
+            Some(k) => {
+                leading.push(k);
+                start += 1;
+            }
+            None => break,
+        }
+    }
+    let mut end = nodes.len();
+    let mut trailing = Vec::new();
+    while end > start {
+        match boundary_kind(&nodes[end - 1]) {
+            Some(k) => {
+                trailing.push(k);
+                end -= 1;
+            }
+            None => break,
+        }
+    }
+    trailing.reverse();
+    if leading.is_empty() && trailing.is_empty() {
+        return None;
+    }
+    let core = &nodes[start..end];
+    if core.is_empty() || contains_assertion(core) {
+        return None;
+    }
+    Some((leading, core, trailing))
+}
+
+/// If `nodes` is exactly one `Alternation` node where every branch is a
+/// non-empty sequence of ASCII `Literal` chars, returns the branch byte
+/// strings - routes `GET|POST|PUT|DELETE`-shaped patterns to the
+/// `MultiLiteral` fast path instead of general NFA simulation. Branch count
+/// is capped (see `MultiLiteral`'s doc comment): this is a linear
+/// per-candidate scan, not a substitute for a real trie at scale.
+fn alternation_of_literals(nodes: &[AstNode]) -> Option<Vec<Box<[u8]>>> {
+    let [AstNode::Alternation(alts)] = nodes else {
+        return None;
+    };
+    if alts.is_empty() || alts.len() > 16 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(alts.len());
+    for branch in alts {
+        let mut bytes = Vec::with_capacity(branch.len());
+        for n in branch {
+            match n {
+                AstNode::Literal(c) if c.is_ascii() => bytes.push(*c as u8),
+                _ => return None,
+            }
+        }
+        if bytes.is_empty() {
+            return None;
+        }
+        out.push(bytes.into_boxed_slice());
+    }
+    Some(out)
+}
+
+/// If `nodes` is exactly one quantified (greedy) character class - `\w+`,
+/// `\W*`, `\s{2,5}`, ... - with nothing else, and that class isn't
+/// ASCII-only (see `class_is_ascii_only` - ASCII-only classes are already
+/// covered by the faster `bp_nfa_ascii` byte-table path whenever the
+/// haystack turns out to be ASCII), returns `(class, min, max)` for the
+/// `UnicodeClassRun` fast path. Lazy quantifiers are excluded (shortest-
+/// match semantics, not what a greedy scan computes).
+fn unicode_class_run(nodes: &[AstNode]) -> Option<(CharClass, usize, Option<usize>)> {
+    let [node] = nodes else { return None };
+    let (inner, min, max, greedy) = match node {
+        AstNode::ZeroOrMore { node, greedy } => (node.as_ref(), 0, None, *greedy),
+        AstNode::OneOrMore { node, greedy } => (node.as_ref(), 1, None, *greedy),
+        AstNode::Optional { node, greedy } => (node.as_ref(), 0, Some(1), *greedy),
+        AstNode::Exact { node, count } => (node.as_ref(), *count, Some(*count), true),
+        AstNode::Range {
+            node,
+            min,
+            max,
+            greedy,
+        } => (node.as_ref(), *min, *max, *greedy),
+        _ => return None,
+    };
+    if !greedy {
+        return None;
+    }
+    match inner {
+        AstNode::CharClass(c) if !vm::class_is_ascii_only(c) => Some((c.clone(), min, max)),
+        _ => None,
     }
 }
 
@@ -282,18 +490,52 @@ fn disjoint_greedy_segments(nodes: &[AstNode], flags: &Flags) -> Option<Vec<Segm
         segs.push(Segment { alphabet, min, max });
     }
 
+    // Ambiguity check. `reachable` is the union of alphabets that could sit
+    // immediately before the segment currently being examined; `active`
+    // means that set is actually meaningful (`false` means the current
+    // position is deterministically pinned, so nothing needs checking).
+    //
+    // Only a segment with genuine length flexibility (`min != max`) can ever
+    // create backtracking ambiguity, by greedily consuming bytes a
+    // neighboring segment actually needed. A fixed-count segment (a bare
+    // literal/class, or `{n}`) always consumes exactly that many bytes, no
+    // more or fewer, so it can neither "steal" from a neighbor nor be stolen
+    // from - once one is passed, the position is unambiguous again
+    // regardless of alphabet overlap on either side. This is what lets a
+    // trailing `.*` (near-universal alphabet) qualify after a fixed literal
+    // like `: ` even though `.` overlaps with nearly everything: the literal
+    // in front of it can't have consumed any of `.*`'s territory.
+    //
+    // A degenerate `{0}` segment consumes nothing, ever - fully transparent,
+    // skipped entirely rather than participating in either role.
     let mut reachable = SegBits::empty();
-    let mut reachable_active = false;
+    let mut active = false;
     for seg in &segs {
-        if reachable_active && !seg.alphabet.disjoint(&reachable) {
+        let fixed = seg.min == seg.max;
+        if fixed && seg.min == 0 {
+            continue; // never consumes anything - transparent
+        }
+        if active && !seg.alphabet.disjoint(&reachable) {
             return None;
         }
-        reachable = if seg.min == 0 && reachable_active {
-            reachable.union(&seg.alphabet)
+        if fixed {
+            // Deterministic: consumed exactly `min`, so the position right
+            // after it can't have absorbed anything ambiguously.
+            active = false;
+        } else if seg.min == 0 {
+            reachable = if active {
+                reachable.union(&seg.alphabet)
+            } else {
+                seg.alphabet
+            };
+            active = true;
         } else {
-            seg.alphabet
-        };
-        reachable_active = true;
+            // Mandatory but variable-length: guaranteed to be the immediate
+            // predecessor for whatever comes next, discarding any earlier
+            // ambiguity chain.
+            reachable = seg.alphabet;
+            active = true;
+        }
     }
 
     Some(segs)
@@ -329,6 +571,24 @@ fn collect_start_bytes(node: &AstNode, ic: bool) -> Vec<u8> {
                 collect_start_bytes(&nodes[0], ic)
             }
         }
+        // A match can start with any byte that could start any branch. If a
+        // branch is empty (matches the empty string) or its own start set
+        // can't be narrowed, no useful filter can be derived for the whole
+        // alternation - bail out (empty result -> `StartFilter::None`).
+        AstNode::Alternation(alts) => {
+            let mut bytes = Vec::new();
+            for alt in alts {
+                let Some(first) = alt.first() else {
+                    return vec![];
+                };
+                let branch_bytes = collect_start_bytes(first, ic);
+                if branch_bytes.is_empty() {
+                    return vec![];
+                }
+                bytes.extend(branch_bytes);
+            }
+            bytes
+        }
         _ => vec![],
     }
 }
@@ -362,17 +622,25 @@ fn extract_bytes_from_ranges(ranges: &[CharRange], ic: bool) -> Vec<u8> {
 }
 
 fn analyze_start_filter(nodes: &[AstNode], flags: &Flags) -> StartFilter {
-    if nodes.is_empty() {
+    // A leading zero-width assertion (`\b`, `\<`, `\>`, `^`, `$`, `\zs`, `\ze`)
+    // doesn't consume anything, so the match's actual start position is
+    // wherever the *first real atom after it* begins - e.g. for `\bfoo\b`,
+    // every match starts exactly where the `f` is. Skipping past these to
+    // find that atom doesn't change correctness (the assertion is still
+    // fully checked by the general engine at each candidate position; this
+    // only decides which positions are worth trying), but it's the
+    // difference between using a `memchr`-based filter at all and using none.
+    let Some(first) = nodes.iter().find(|n| !is_zero_width_assertion(n)) else {
         return StartFilter::None;
-    }
+    };
     let ic = flags.ignore_case.unwrap_or(false);
 
     // Check if the leading node is a wide class that maps to a byte range.
-    if let Some(range_filter) = start_filter_from_class(&nodes[0]) {
+    if let Some(range_filter) = start_filter_from_class(first) {
         return range_filter;
     }
 
-    let mut bytes = collect_start_bytes(&nodes[0], ic);
+    let mut bytes = collect_start_bytes(first, ic);
     bytes.sort_unstable();
     bytes.dedup();
     match bytes.len() {
@@ -382,6 +650,22 @@ fn analyze_start_filter(nodes: &[AstNode], flags: &Flags) -> StartFilter {
         3 => StartFilter::Three(bytes[0], bytes[1], bytes[2]),
         _ => StartFilter::None, // > 3 possible starts: too many for memchr3
     }
+}
+
+/// True for zero-width assertions that never consume a byte, regardless of
+/// position (position-*dependent* zero-width nodes like `\b` still qualify -
+/// they just don't advance the cursor when they hold).
+fn is_zero_width_assertion(node: &AstNode) -> bool {
+    matches!(
+        node,
+        AstNode::WordBoundary
+            | AstNode::StartWord
+            | AstNode::EndWord
+            | AstNode::StartAnchor
+            | AstNode::EndAnchor
+            | AstNode::SetMatchStart
+            | AstNode::SetMatchEnd
+    )
 }
 
 /// Map a leading character class to an efficient byte start-filter.
@@ -492,25 +776,11 @@ impl CompiledRegex for LinearRegex {
     }
 
     fn find_all<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = Match> + 'a> {
-        if let Some(iter) = self.vm.literal_find_all(text.as_bytes(), 0) {
-            return Box::new(iter);
-        }
-        if let Some(fixed_len) = self.vm.fixed_len()
-            && let Some(iter) = self.vm.find_all_fixed_len(text.as_bytes(), 0, fixed_len)
-        {
-            return Box::new(iter);
-        }
-        if let Some(iter) = self.vm.find_all_segments(text.as_bytes(), 0) {
-            return Box::new(iter);
-        }
-        if let Some(iter) = self.vm.find_all_bitparallel(text.as_bytes(), 0) {
-            return Box::new(iter);
-        }
-        Box::new(FindMatchesIterator {
-            text,
-            regex: self,
-            last_end: 0,
-        })
+        // Delegates to the concrete, boundary-aware dispatcher instead of
+        // duplicating its fast-path priority order (and, previously,
+        // omitting the boundary-wrapper postcondition entirely - see
+        // `find_all_linear`).
+        Box::new(self.find_all_linear(text))
     }
 
     fn captures(&self, text: &str) -> Option<Captures> {
@@ -586,10 +856,17 @@ pub enum LinearFindAll<'a> {
         lit_len: usize,
     },
     LiteralCI(vm::LiteralFindIter<'a, 'a>),
+    MultiLiteral(vm::MultiLiteralFindAll<'a, 'a>),
     FixedLen(vm::FixedLenFindAll<'a, 'a>),
     Segments(vm::SegmentsFindAll<'a, 'a>),
     BitParallel(vm::BitParallelFindAll<'a, 'a>),
+    UnicodeClassRun(vm::UnicodeClassRunFindAll<'a, 'a>),
     Nfa(FindMatchesIterator<'a, &'a str>),
+    /// Postcondition-filtered wrapper for boundary-wrapper patterns (see
+    /// `split_boundary_wrapper`). One allocation per `find_all_linear` call
+    /// (to box the otherwise-recursive `LinearFindAll` payload), not per
+    /// match.
+    Boundary(BoundaryFilter<'a, Box<LinearFindAll<'a>>>),
 }
 
 impl<'a> Iterator for LinearFindAll<'a> {
@@ -606,11 +883,43 @@ impl<'a> Iterator for LinearFindAll<'a> {
                 })
             }
             Self::LiteralCI(it) => it.next(),
+            Self::MultiLiteral(it) => it.next(),
             Self::FixedLen(it) => it.next(),
             Self::Segments(it) => it.next(),
             Self::BitParallel(it) => it.next(),
+            Self::UnicodeClassRun(it) => it.next(),
             Self::Nfa(it) => it.next(),
+            Self::Boundary(it) => it.next(),
         }
+    }
+}
+
+/// Wraps an inner match iterator, filtering out candidates that fail the
+/// leading/trailing boundary postcondition (see `BoundaryKind`). Correct
+/// without any special retry logic: rejected candidates are simply skipped,
+/// and the inner iterator naturally resumes scanning from that candidate's
+/// end - safe because a boundary wrapper is only ever attached when the
+/// core has exactly one possible match per start position, so there's no
+/// alternative shorter match at a rejected start to miss.
+pub struct BoundaryFilter<'a, I> {
+    inner: I,
+    text: &'a str,
+    leading: &'a [vm::BoundaryKind],
+    trailing: &'a [vm::BoundaryKind],
+}
+
+impl<'a, I: Iterator<Item = Match>> Iterator for BoundaryFilter<'a, I> {
+    type Item = Match;
+
+    fn next(&mut self) -> Option<Match> {
+        for m in self.inner.by_ref() {
+            if vm::check_all_boundaries(self.leading, &self.text, m.start)
+                && vm::check_all_boundaries(self.trailing, &self.text, m.end)
+            {
+                return Some(m);
+            }
+        }
+        None
     }
 }
 

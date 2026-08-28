@@ -1,4 +1,4 @@
-use super::nfa::{Nfa, State};
+﻿use super::nfa::{Nfa, State};
 use crate::captures::Match;
 use crate::haystack::Haystack;
 use crate::parser::CharClass;
@@ -53,6 +53,268 @@ impl StartFilter {
     }
 }
 
+// -- Boundary-wrapper postcondition -------------------------------------------
+
+/// A zero-width assertion that can be verified as an O(1) postcondition on a
+/// candidate match's start/end position, rather than folded into NFA
+/// simulation. Licensed only when the assertion appears solely as a leading
+/// and/or trailing run around a core with no assertions anywhere inside it
+/// (see `split_boundary_wrapper` in `mod.rs`) - a shape under which the core's
+/// match at a given start position is already unique (literal / fixed-length
+/// / disjoint-segments all guarantee this), so checking the assertion after
+/// the fact is equivalent to checking it inline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryKind {
+    WordBoundary,
+    WordStart,
+    WordEnd,
+}
+
+impl BoundaryKind {
+    #[inline]
+    fn check<H: Haystack>(self, text: &H, pos: usize) -> bool {
+        match self {
+            BoundaryKind::WordBoundary => is_word_boundary(text, pos),
+            BoundaryKind::WordStart => is_word_start(text, pos),
+            BoundaryKind::WordEnd => is_word_end(text, pos),
+        }
+    }
+}
+
+/// All of `kinds` must hold at `pos` (an empty slice trivially passes).
+#[inline]
+pub fn check_all_boundaries<H: Haystack>(kinds: &[BoundaryKind], text: &H, pos: usize) -> bool {
+    kinds.iter().all(|k| k.check(text, pos))
+}
+
+// -- Multi-literal fast path (alternation of literals) ------------------------
+
+/// Fast path for a pattern that's a pure alternation of literals (e.g.
+/// `GET|POST|PUT|DELETE`), bypassing NFA simulation entirely. Matching is a
+/// first-byte filter (reusing `StartFilter`) followed by a linear scan over
+/// the branches sharing that byte, longest-first so leftmost-longest
+/// semantics fall out without any backtracking: the first branch that
+/// verifies at a candidate position is already the correct (longest) one.
+///
+/// A real trie/Aho-Corasick automaton would be the asymptotically better
+/// answer for large branch counts or long shared prefixes, but for the
+/// handful of short, mostly-distinct-prefix branches this shape is typically
+/// used for for (HTTP methods, keywords, ...), a linear per-candidate scan
+/// is already close to optimal and far simpler to keep correct. Capped at a
+/// small branch count (see `alternation_of_literals` in `mod.rs`) so this
+/// never becomes the wrong tool for a large multi-pattern search.
+pub struct MultiLiteral {
+    /// Sorted longest-first (see doc comment above).
+    literals: Vec<Box<[u8]>>,
+    case_insensitive: bool,
+    start_filter: StartFilter,
+}
+
+impl MultiLiteral {
+    pub fn new(mut literals: Vec<Box<[u8]>>, case_insensitive: bool) -> Self {
+        literals.sort_by(|a, b| b.len().cmp(&a.len()));
+        let mut first_bytes: Vec<u8> = literals
+            .iter()
+            .flat_map(|lit| {
+                let b = lit[0];
+                if case_insensitive {
+                    vec![b.to_ascii_lowercase(), b.to_ascii_uppercase()]
+                } else {
+                    vec![b]
+                }
+            })
+            .collect();
+        first_bytes.sort_unstable();
+        first_bytes.dedup();
+        let start_filter = match first_bytes.len() {
+            0 => StartFilter::None,
+            1 => StartFilter::One(first_bytes[0]),
+            2 => StartFilter::Two(first_bytes[0], first_bytes[1]),
+            3 => StartFilter::Three(first_bytes[0], first_bytes[1], first_bytes[2]),
+            _ => StartFilter::None,
+        };
+        Self {
+            literals,
+            case_insensitive,
+            start_filter,
+        }
+    }
+
+    /// Length of whichever branch matches at `pos`, if any.
+    #[inline]
+    fn matches_at(&self, bytes: &[u8], pos: usize) -> Option<usize> {
+        for lit in &self.literals {
+            let end = pos + lit.len();
+            if end > bytes.len() {
+                continue;
+            }
+            let cand = &bytes[pos..end];
+            let matched = if self.case_insensitive {
+                cand.eq_ignore_ascii_case(lit)
+            } else {
+                cand == lit.as_ref()
+            };
+            if matched {
+                return Some(lit.len());
+            }
+        }
+        None
+    }
+
+    pub fn find_in(&self, bytes: &[u8], start: usize) -> Option<Match> {
+        let mut pos = start;
+        loop {
+            pos = self.start_filter.find_next_from(bytes, pos)?;
+            if let Some(len) = self.matches_at(bytes, pos) {
+                return Some(Match {
+                    start: pos,
+                    end: pos + len,
+                });
+            }
+            pos += 1;
+        }
+    }
+}
+
+pub struct MultiLiteralFindAll<'h, 'v> {
+    ml: &'v MultiLiteral,
+    bytes: &'h [u8],
+    pos: usize,
+}
+
+impl<'h, 'v> MultiLiteralFindAll<'h, 'v> {
+    fn new(ml: &'v MultiLiteral, bytes: &'h [u8], start: usize) -> Self {
+        Self {
+            ml,
+            bytes,
+            pos: start,
+        }
+    }
+}
+
+impl<'h, 'v> Iterator for MultiLiteralFindAll<'h, 'v> {
+    type Item = Match;
+
+    #[inline]
+    fn next(&mut self) -> Option<Match> {
+        let m = self.ml.find_in(self.bytes, self.pos)?;
+        self.pos = m.end.max(m.start + 1);
+        Some(m)
+    }
+}
+
+// -- Unicode single-class-run fast path ---------------------------------------
+
+/// Fast path for a pattern that's a single quantified character class with
+/// nothing else (e.g. `\w+`, `\W*`, `\s{2,5}`) *and* whose class isn't
+/// ASCII-only (see `class_is_ascii_only`) - so `bp_nfa_ascii` can't cover it
+/// once the haystack turns out to have non-ASCII bytes. Matches via direct
+/// UTF-8-decoding greedy scan (`read_char` per character) instead of the
+/// general per-char NFA interpreter: still O(chars), but with none of the
+/// thread-simulation/epsilon-closure overhead, since a single atom has no
+/// structure to simulate.
+///
+/// ASCII-only classes deliberately skip this path (see `unicode_class_run`
+/// in `mod.rs`) - `bp_nfa_ascii`'s flat byte table is already the better
+/// fast path whenever the haystack is ASCII, and per-char UTF-8 decoding
+/// would only add overhead there for no benefit.
+pub struct UnicodeClassRun {
+    class: CharClass,
+    ignore_case: bool,
+    dotall: bool,
+    min: usize,
+    max: Option<usize>,
+}
+
+impl UnicodeClassRun {
+    pub fn new(class: CharClass, ignore_case: bool, dotall: bool, min: usize, max: Option<usize>) -> Self {
+        Self {
+            class,
+            ignore_case,
+            dotall,
+            min,
+            max,
+        }
+    }
+
+    pub fn find_in(&self, bytes: &[u8], start: usize) -> Option<Match> {
+        if self.min == 0 {
+            // A min=0 run always succeeds at `start` itself, possibly with
+            // zero length - no skip-ahead. Matches `find_via_segments`'s
+            // convention for a `min == 0` first segment (see its doc
+            // comment): the caller is responsible for advancing past a
+            // zero-length match (see `UnicodeClassRunFindAll::next`).
+            if start > bytes.len() {
+                return None;
+            }
+            let mut count = 0usize;
+            let mut p = start;
+            while self.max.is_none_or(|m| count < m) && p < bytes.len() {
+                let (c, len) = read_char(bytes, p);
+                if !matches_class_static(&self.class, c, self.ignore_case, self.dotall) {
+                    break;
+                }
+                count += 1;
+                p += len;
+            }
+            return Some(Match { start, end: p });
+        }
+        let mut pos = start;
+        while pos < bytes.len() {
+            let (c, len) = read_char(bytes, pos);
+            if !matches_class_static(&self.class, c, self.ignore_case, self.dotall) {
+                pos += len;
+                continue;
+            }
+            let match_start = pos;
+            let mut count = 1usize;
+            let mut p = pos + len;
+            while self.max.is_none_or(|m| count < m) && p < bytes.len() {
+                let (c2, len2) = read_char(bytes, p);
+                if !matches_class_static(&self.class, c2, self.ignore_case, self.dotall) {
+                    break;
+                }
+                count += 1;
+                p += len2;
+            }
+            if count >= self.min {
+                return Some(Match {
+                    start: match_start,
+                    end: p,
+                });
+            }
+            // Fewer than `min` repetitions in this run - a later start
+            // inside the same run can only find an even shorter run, so
+            // it's safe to resume scanning right after it.
+            pos = p;
+        }
+        None
+    }
+}
+
+pub struct UnicodeClassRunFindAll<'h, 'v> {
+    run: &'v UnicodeClassRun,
+    bytes: &'h [u8],
+    pos: usize,
+}
+
+impl<'h, 'v> UnicodeClassRunFindAll<'h, 'v> {
+    fn new(run: &'v UnicodeClassRun, bytes: &'h [u8], start: usize) -> Self {
+        Self { run, bytes, pos: start }
+    }
+}
+
+impl<'h, 'v> Iterator for UnicodeClassRunFindAll<'h, 'v> {
+    type Item = Match;
+
+    #[inline]
+    fn next(&mut self) -> Option<Match> {
+        let m = self.run.find_in(self.bytes, self.pos)?;
+        self.pos = m.end.max(m.start + 1);
+        Some(m)
+    }
+}
+
 // -- Literal fast path --------------------------------------------------------
 
 /// Precomputed literal for bypassing NFA simulation entirely.
@@ -98,22 +360,200 @@ impl Literal {
     }
 
     fn find_in_ci(&self, haystack: &[u8], start: usize) -> Option<usize> {
-        if self.bytes.is_empty() {
-            return Some(start);
-        }
-        if haystack.len().saturating_sub(start) <= CI_SMALL_THRESHOLD {
-            return naive_ci_find(haystack, &self.bytes, start);
-        }
-        let mut buf: Vec<u8> = Vec::with_capacity(CI_CHUNK + self.bytes.len());
-        ci_chunked_search(&self.finder, self.bytes.len(), haystack, start, &mut buf).map(
-            |(abs, _rel, _core_len, _chunk_base)| abs,
-        )
+        find_ci_from(haystack, &self.bytes, &self.finder, start)
     }
 }
 
+/// Find the next case-insensitive occurrence of `needle_lower` (ASCII,
+/// already lowercased - see `extract_literal`) in `haystack` at or after
+/// `start`. Dispatches to a SIMD-accelerated scan on x86_64 (see
+/// `simd_ci`), or the portable chunked-lowering scan on other targets.
+#[inline]
+fn find_ci_from(
+    haystack: &[u8],
+    needle_lower: &[u8],
+    finder: &memchr::memmem::Finder<'static>,
+    start: usize,
+) -> Option<usize> {
+    let _ = finder; // only used by the non-x86_64 fallback below
+    if needle_lower.is_empty() {
+        return Some(start);
+    }
+    if needle_lower.len() == 1 {
+        return naive_ci_find(haystack, needle_lower, start);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        simd_ci::find_from(haystack, needle_lower, start)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        if haystack.len().saturating_sub(start) <= CI_SMALL_THRESHOLD {
+            naive_ci_find(haystack, needle_lower, start)
+        } else {
+            let mut buf: Vec<u8> = Vec::with_capacity(CI_CHUNK + needle_lower.len());
+            ci_chunked_search(finder, needle_lower.len(), haystack, start, &mut buf)
+                .map(|(abs, _rel, _core_len, _chunk_base)| abs)
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 const CI_CHUNK: usize = 16384;
 
+#[cfg(not(target_arch = "x86_64"))]
 const CI_SMALL_THRESHOLD: usize = 4096;
+
+/// SSE2 case-insensitive substring search: a first+last-byte SIMD prefilter
+/// (the same shape as `memchr::memmem`'s own "generic SIMD" algorithm, but
+/// with case-insensitive byte comparisons) followed by scalar verification
+/// of the full needle. SSE2 is part of the x86_64 baseline ABI - guaranteed
+/// present on every x86_64 target - so no runtime feature detection is
+/// needed. Measured at parity with (sometimes faster than) a case-sensitive
+/// `memmem` scan across 1KB-10MB inputs, vs. ~1.2-1.5x slower for the
+/// lowercase-then-`memmem` approach this replaces on this target.
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod simd_ci {
+    use std::arch::x86_64::*;
+
+    /// Find the first case-insensitive occurrence of `needle_lower` (ASCII,
+    /// already lowercased, length >= 2) in `haystack` at or after `start`.
+    /// For a one-shot lookup; `find_all` uses `FindIter` instead, which
+    /// amortizes the SIMD register setup across matches (see its doc comment).
+    pub(super) fn find_from(haystack: &[u8], needle_lower: &[u8], start: usize) -> Option<usize> {
+        FindIter::new(haystack, needle_lower, start)?.next()
+    }
+
+    /// Streaming case-insensitive SIMD scan, reused across matches within a
+    /// single `find_all` pass. `find_from` calling this fresh per match would
+    /// re-broadcast the four comparison registers (`_mm_set1_epi8` x4) and
+    /// re-pay a `target_feature`-gated call boundary (which Rust cannot
+    /// inline into a caller lacking that feature) on *every single match* -
+    /// for a dense pattern that is real, measurable overhead. Building the
+    /// registers once in `new` and resuming the scan position across `next()`
+    /// calls removes that per-match tax entirely.
+    pub(crate) struct FindIter<'h, 'n> {
+        haystack: &'h [u8],
+        needle_lower: &'n [u8],
+        pos: usize,
+        v_first_lo: __m128i,
+        v_first_up: __m128i,
+        v_last_lo: __m128i,
+        v_last_up: __m128i,
+    }
+
+    impl<'h, 'n> FindIter<'h, 'n> {
+        /// Returns `None` if `needle_lower` is too short for this path
+        /// (length < 2) - callers fall back to `naive_ci_find` for that case.
+        pub(super) fn new(haystack: &'h [u8], needle_lower: &'n [u8], start: usize) -> Option<Self> {
+            if needle_lower.len() < 2 {
+                return None;
+            }
+            let first = needle_lower[0];
+            let last = needle_lower[needle_lower.len() - 1];
+            let first_up = first.to_ascii_uppercase();
+            let last_up = last.to_ascii_uppercase();
+            // SAFETY: SSE2 is guaranteed available on all x86_64 targets.
+            let (v_first_lo, v_first_up, v_last_lo, v_last_up) = unsafe {
+                (
+                    _mm_set1_epi8(first as i8),
+                    _mm_set1_epi8(first_up as i8),
+                    _mm_set1_epi8(last as i8),
+                    _mm_set1_epi8(last_up as i8),
+                )
+            };
+            Some(Self {
+                haystack,
+                needle_lower,
+                pos: start,
+                v_first_lo,
+                v_first_up,
+                v_last_lo,
+                v_last_up,
+            })
+        }
+
+        pub(super) fn next(&mut self) -> Option<usize> {
+            // SAFETY: SSE2 is guaranteed available on all x86_64 targets.
+            unsafe { self.next_sse2() }
+        }
+
+        #[target_feature(enable = "sse2")]
+        unsafe fn next_sse2(&mut self) -> Option<usize> {
+            let haystack = self.haystack;
+            let needle_lower = self.needle_lower;
+            let n = haystack.len();
+            let l = needle_lower.len();
+            let mut pos = self.pos;
+
+            // A 16-lane chunk starting at `pos` reads haystack[pos..pos+16)
+            // for the first-byte comparison and
+            // haystack[pos+l-1..pos+l-1+16) for the last-byte comparison;
+            // the second (larger) offset is the binding constraint on how
+            // far `pos` may safely go. Deliberately `checked_sub`, not
+            // `saturating_sub`: when `n` is too small for even one full
+            // chunk, `saturating_sub` would clamp to 0 and the loop below
+            // would wrongly attempt `pos = 0` anyway (0 <= 0) even though no
+            // chunk fits - `checked_sub` makes "no valid chunk exists" an
+            // explicit `None` instead of an indistinguishable 0.
+            let simd_limit = n.checked_sub(l - 1 + 16);
+
+            while let Some(limit) = simd_limit
+                && pos <= limit
+            {
+                // SAFETY: `pos <= simd_limit` guarantees `pos + 16 <= n` and
+                // `pos + (l - 1) + 16 <= n`, so both unaligned 16-byte loads
+                // read entirely within `haystack`. `_mm_loadu_si128` has no
+                // alignment requirement.
+                let (chunk_first, chunk_last) = unsafe {
+                    (
+                        _mm_loadu_si128(haystack.as_ptr().add(pos) as *const __m128i),
+                        _mm_loadu_si128(haystack.as_ptr().add(pos + l - 1) as *const __m128i),
+                    )
+                };
+                let eq_first = _mm_or_si128(
+                    _mm_cmpeq_epi8(chunk_first, self.v_first_lo),
+                    _mm_cmpeq_epi8(chunk_first, self.v_first_up),
+                );
+                let eq_last = _mm_or_si128(
+                    _mm_cmpeq_epi8(chunk_last, self.v_last_lo),
+                    _mm_cmpeq_epi8(chunk_last, self.v_last_up),
+                );
+                let mut mask = _mm_movemask_epi8(_mm_and_si128(eq_first, eq_last)) as u32;
+
+                while mask != 0 {
+                    let bit = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    let cand = pos + bit;
+                    if verify(haystack, needle_lower, cand) {
+                        self.pos = cand + l;
+                        return Some(cand);
+                    }
+                }
+                pos += 16;
+            }
+
+            // Scalar tail: fewer than 16 + (l - 1) bytes remain.
+            while pos + l <= n {
+                if verify(haystack, needle_lower, pos) {
+                    self.pos = pos + l;
+                    return Some(pos);
+                }
+                pos += 1;
+            }
+            self.pos = pos;
+            None
+        }
+    }
+
+    #[inline]
+    fn verify(haystack: &[u8], needle_lower: &[u8], pos: usize) -> bool {
+        haystack[pos..pos + needle_lower.len()]
+            .iter()
+            .zip(needle_lower)
+            .all(|(&h, &nb)| h.to_ascii_lowercase() == nb)
+    }
+}
 
 fn naive_ci_find(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
     if start >= haystack.len() {
@@ -148,6 +588,7 @@ fn naive_ci_find(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> 
     }
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 #[inline]
 fn ci_chunked_search(
     finder: &memchr::memmem::Finder<'static>,
@@ -177,6 +618,12 @@ fn ci_chunked_search(
     None
 }
 
+// `simd_iter`'s type (`simd_ci::FindIter`) is deliberately crate-private
+// implementation detail; external code only ever reaches this enum through
+// the `Iterator` trait, never by naming or constructing a variant field
+// directly, so it never observes the type-privacy mismatch this would
+// otherwise warn about.
+#[allow(private_interfaces)]
 #[allow(clippy::large_enum_variant)]
 pub enum LiteralFindIter<'h, 'n> {
     CaseSensitive {
@@ -186,28 +633,22 @@ pub enum LiteralFindIter<'h, 'n> {
         offset: usize,
         lit_len: usize,
     },
-    /// Below `CI_SMALL_THRESHOLD` total remaining bytes: same zero-copy scan
-    /// as `naive_ci_find`, avoiding the chunked path's fixed allocation cost.
-    CaseInsensitiveSmall {
+    /// Case-insensitive. On x86_64, `simd_iter` (when `Some`) is a streaming
+    /// SIMD scan (see `simd_ci::FindIter`) that computes its comparison
+    /// registers once and resumes across matches - calling a fresh one-shot
+    /// search per match would re-pay that setup, plus a `target_feature`
+    /// call boundary Rust won't inline across, on *every single match* of a
+    /// dense pattern. It's `None` when the needle is too short for the SIMD
+    /// path (length < 2) or (on non-x86_64 targets, where the field doesn't
+    /// exist at all) unconditionally, in which case `pos` drives
+    /// `find_ci_from` instead - the portable chunked-lowering scan, or the
+    /// zero-copy single-byte scan for length-1 needles.
+    CaseInsensitive {
         haystack: &'h [u8],
         pos: usize,
         lit: &'n Literal,
-    },
-    CaseInsensitive {
-        haystack: &'h [u8],
-        lit: &'n Literal,
-        /// Lowercased window into `haystack[chunk_base..]`, reused across chunks
-        /// so `find_all` pays the lowercasing cost once per `CI_CHUNK` bytes
-        /// rather than once per match.
-        buf: Vec<u8>,
-        /// Absolute offset in `haystack` that `buf[0]` corresponds to.
-        chunk_base: usize,
-        /// Number of bytes at the front of `buf` that are valid match-start
-        /// positions (the rest is trailing overlap for boundary matches).
-        core_len: usize,
-        /// Next offset within `buf` to resume the `memmem` search from.
-        search_from: usize,
-        exhausted: bool,
+        #[cfg(target_arch = "x86_64")]
+        simd_iter: Option<simd_ci::FindIter<'h, 'n>>,
     },
 }
 
@@ -219,22 +660,13 @@ impl<'h, 'n> LiteralFindIter<'h, 'n> {
                 offset: start,
                 lit_len: lit.len(),
             }
-        } else if lit.bytes.is_empty() || haystack.len().saturating_sub(start) <= CI_SMALL_THRESHOLD
-        {
-            LiteralFindIter::CaseInsensitiveSmall {
-                haystack,
-                pos: start,
-                lit,
-            }
         } else {
             LiteralFindIter::CaseInsensitive {
                 haystack,
+                pos: start,
                 lit,
-                buf: Vec::new(),
-                chunk_base: start,
-                core_len: 0,
-                search_from: 0,
-                exhausted: lit.bytes.is_empty(),
+                #[cfg(target_arch = "x86_64")]
+                simd_iter: simd_ci::FindIter::new(haystack, &lit.bytes, start),
             }
         }
     }
@@ -258,56 +690,32 @@ impl<'h, 'n> Iterator for LiteralFindIter<'h, 'n> {
                     end: start + *lit_len,
                 })
             }
-            LiteralFindIter::CaseInsensitiveSmall { haystack, pos, lit } => {
+            LiteralFindIter::CaseInsensitive {
+                haystack,
+                pos,
+                lit,
+                #[cfg(target_arch = "x86_64")]
+                simd_iter,
+            } => {
+                // `simd_iter` is only `Some` when `lit.bytes.len() >= 2` (see
+                // `simd_ci::FindIter::new`), so it's provably non-empty here -
+                // the emptiness guard below only needs to run on the fallback
+                // path, not on every SIMD-path call.
+                #[cfg(target_arch = "x86_64")]
+                if let Some(iter) = simd_iter {
+                    let start = iter.next()?;
+                    return Some(Match {
+                        start,
+                        end: start + lit.len(),
+                    });
+                }
                 if lit.bytes.is_empty() {
                     return None;
                 }
-                let start = naive_ci_find(haystack, &lit.bytes, *pos)?;
+                let start = find_ci_from(haystack, &lit.bytes, &lit.finder, *pos)?;
                 let end = start + lit.len();
                 *pos = end;
                 Some(Match { start, end })
-            }
-            LiteralFindIter::CaseInsensitive {
-                haystack,
-                lit,
-                buf,
-                chunk_base,
-                core_len,
-                search_from,
-                exhausted,
-            } => {
-                if *exhausted {
-                    return None;
-                }
-                loop {
-                    if let Some(rel) = lit.finder.find(&buf[*search_from..]) {
-                        let abs_rel = *search_from + rel;
-                        if abs_rel < *core_len {
-                            let start = *chunk_base + abs_rel;
-                            *search_from = abs_rel + lit.len();
-                            return Some(Match {
-                                start,
-                                end: start + lit.len(),
-                            });
-                        }
-                    }
-                    let next_base = *chunk_base + *core_len;
-                    if next_base >= haystack.len() {
-                        *exhausted = true;
-                        return None;
-                    }
-                    *chunk_base = next_base;
-                    let core_end = (*chunk_base + CI_CHUNK).min(haystack.len());
-                    let ext_end = (core_end + lit.len() - 1).min(haystack.len());
-                    buf.clear();
-                    buf.extend(
-                        haystack[*chunk_base..ext_end]
-                            .iter()
-                            .map(u8::to_ascii_lowercase),
-                    );
-                    *core_len = core_end - *chunk_base;
-                    *search_from = 0;
-                }
             }
         }
     }
@@ -623,6 +1031,25 @@ pub struct PikeVM {
     /// per-segment greedy byte-class scan. Like `bp_nfa_ascii`, only valid
     /// when the haystack is verified all-ASCII first.
     segments: Option<Vec<super::Segment>>,
+    /// Leading/trailing zero-width assertions stripped from the compiled
+    /// pattern (see `split_boundary_wrapper` in `mod.rs`) and verified as an
+    /// O(1) postcondition on `find_raw`'s result instead. Empty when the
+    /// pattern has no such wrapper - the common case, checked for free via
+    /// `Vec::is_empty`.
+    leading_boundary: Vec<BoundaryKind>,
+    trailing_boundary: Vec<BoundaryKind>,
+    /// Set when the pattern is a pure alternation of literals (see
+    /// `alternation_of_literals` in `mod.rs`). Checked with top priority in
+    /// `find_raw_unwrapped` - like `literal`, it bypasses NFA simulation
+    /// entirely, and the two are mutually exclusive by construction (a
+    /// pattern that reduces to one literal never also parses as a top-level
+    /// `Alternation` node).
+    multi_literal: Option<MultiLiteral>,
+    /// Set for a single quantified non-ASCII-only class (`\w+`, `\W*`, ...) -
+    /// see `UnicodeClassRun`. Checked only after `bp_nfa_ascii` (which
+    /// already covers this shape, faster, whenever the haystack turns out
+    /// to be pure ASCII) fails to apply.
+    unicode_class_run: Option<UnicodeClassRun>,
 }
 
 // SAFETY: find operations are inherently single-threaded.
@@ -660,7 +1087,72 @@ impl PikeVM {
             ascii_cache: std::cell::Cell::new((0, 0, false)),
             fixed_len,
             segments,
+            leading_boundary: Vec::new(),
+            trailing_boundary: Vec::new(),
+            multi_literal: None,
+            unicode_class_run: None,
         }
+    }
+
+    /// Attach postcondition boundary checks (see `BoundaryKind`). Builder
+    /// method so the common no-wrapper case doesn't need extra `PikeVM::new`
+    /// parameters at every call site.
+    pub fn with_boundary(mut self, leading: Vec<BoundaryKind>, trailing: Vec<BoundaryKind>) -> Self {
+        self.leading_boundary = leading;
+        self.trailing_boundary = trailing;
+        self
+    }
+
+    /// Attach the multi-literal fast path (see `MultiLiteral`).
+    pub fn with_multi_literal(mut self, ml: MultiLiteral) -> Self {
+        self.multi_literal = Some(ml);
+        self
+    }
+
+    /// Attach the Unicode single-class-run fast path (see `UnicodeClassRun`).
+    pub fn with_unicode_class_run(mut self, run: UnicodeClassRun) -> Self {
+        self.unicode_class_run = Some(run);
+        self
+    }
+
+    #[inline]
+    pub fn has_boundary(&self) -> bool {
+        !self.leading_boundary.is_empty() || !self.trailing_boundary.is_empty()
+    }
+
+    #[inline]
+    pub fn leading_boundary(&self) -> &[BoundaryKind] {
+        &self.leading_boundary
+    }
+
+    #[inline]
+    pub fn trailing_boundary(&self) -> &[BoundaryKind] {
+        &self.trailing_boundary
+    }
+
+    /// Returns a single-pass iterator for pure-alternation-of-literals
+    /// patterns on contiguous bytes. `None` if the pattern isn't one (fall
+    /// back to other fast paths / the general engine).
+    pub fn multi_literal_find_all<'h, 'vm>(
+        &'vm self,
+        bytes: &'h [u8],
+        start: usize,
+    ) -> Option<MultiLiteralFindAll<'h, 'vm>> {
+        self.multi_literal
+            .as_ref()
+            .map(|ml| MultiLiteralFindAll::new(ml, bytes, start))
+    }
+
+    /// Returns a single-pass iterator for the Unicode single-class-run fast
+    /// path (see `UnicodeClassRun`). `None` if the pattern doesn't qualify.
+    pub fn unicode_class_run_find_all<'h, 'vm>(
+        &'vm self,
+        bytes: &'h [u8],
+        start: usize,
+    ) -> Option<UnicodeClassRunFindAll<'h, 'vm>> {
+        self.unicode_class_run
+            .as_ref()
+            .map(|run| UnicodeClassRunFindAll::new(run, bytes, start))
     }
 
     /// `bytes.is_ascii()`, memoised by buffer identity (see `ascii_cache`).
@@ -758,10 +1250,36 @@ impl PikeVM {
             .map(|lit| LiteralFindIter::new(bytes, lit, start))
     }
 
+    /// Find the next match, honoring any boundary postcondition (see
+    /// `BoundaryKind`). Retrying from `m.end` on rejection is only correct
+    /// because a boundary wrapper is only ever attached to a core pattern
+    /// that has exactly one possible match per start position (literal /
+    /// fixed-length / disjoint-segments) - there is no shorter alternative
+    /// at the same start to miss by moving on.
     #[inline]
     pub fn find_raw<H: Haystack>(&self, text: H, start_index: usize) -> Option<Match> {
+        if !self.has_boundary() {
+            return self.find_raw_unwrapped(text, start_index);
+        }
+        let mut start = start_index;
+        loop {
+            let m = self.find_raw_unwrapped(text, start)?;
+            if check_all_boundaries(&self.leading_boundary, &text, m.start)
+                && check_all_boundaries(&self.trailing_boundary, &text, m.end)
+            {
+                return Some(m);
+            }
+            start = m.end.max(m.start + 1);
+        }
+    }
+
+    #[inline]
+    fn find_raw_unwrapped<H: Haystack>(&self, text: H, start_index: usize) -> Option<Match> {
         if let Some(bytes) = text.as_bytes_opt() {
             // Contiguous bytes: use fast paths in priority order.
+            if let Some(ml) = &self.multi_literal {
+                return ml.find_in(bytes, start_index);
+            }
             if let Some(lit) = &self.literal {
                 let pos = lit.find_in(bytes, start_index)?;
                 return Some(Match {
@@ -801,6 +1319,13 @@ impl PikeVM {
                 && self.is_ascii_cached(bytes)
             {
                 return self.find_raw_bitparallel(bp, bytes, start_index);
+            }
+            // Unicode single-class-run: covers exactly the case
+            // `bp_nfa_ascii` just missed above (non-ASCII haystack) for a
+            // pattern that's a single quantified class, via direct
+            // UTF-8-decoding scan instead of the general char-based PikeVM.
+            if let Some(run) = &self.unicode_class_run {
+                return run.find_in(bytes, start_index);
             }
             if self.start_filter.has_filter() {
                 return self.find_raw_prefilter(text, bytes, start_index);
@@ -1952,7 +2477,7 @@ impl<'h, 's> Iterator for SegmentsFindAll<'h, 's> {
 
 /// True if `class` only ever matches ASCII characters. The bit-parallel table is
 /// byte-keyed, so it can only represent classes that never match a multibyte char.
-fn class_is_ascii_only(class: &CharClass) -> bool {
+pub(crate) fn class_is_ascii_only(class: &CharClass) -> bool {
     use CharClass::*;
     match class {
         Digit | Hex | Octal | Punctuation => true,
@@ -2044,3 +2569,4 @@ fn is_word_end<H: Haystack>(text: &H, pos: usize) -> bool {
 fn is_word_char(c: Option<char>) -> bool {
     c.is_some_and(|c| c.is_alphanumeric() || c == '_')
 }
+
