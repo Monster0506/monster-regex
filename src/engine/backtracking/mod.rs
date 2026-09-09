@@ -1,11 +1,14 @@
 use crate::captures::Match;
 use crate::flags::Flags;
-use crate::parser::{AstNode, CharClass};
+use crate::parser::{AstNode, CharClass, SubroutineTarget};
 
 use crate::haystack::{Haystack, HaystackCursor};
 use std::cell::Cell;
+use std::collections::HashMap;
 
 const DEFAULT_MAX_BACKTRACK_STEPS: u64 = 2_000_000;
+
+const MAX_SUBROUTINE_DEPTH: usize = 30;
 
 type MatchCont<'c, C> =
     dyn FnMut(usize, &mut MatchContext, &mut C, Option<char>) -> Option<usize> + 'c;
@@ -18,6 +21,10 @@ pub struct Matcher<'a, H: Haystack> {
     prefilter: &'a Prefilter,
     steps: Cell<u64>,
     max_steps: u64,
+    subroutine_groups: HashMap<usize, &'a AstNode>,
+    /// Current live subroutine-call nesting depth - see
+    /// `MAX_SUBROUTINE_DEPTH`.
+    subroutine_depth: Cell<usize>,
 }
 
 struct QuantifierParams {
@@ -52,6 +59,8 @@ impl MatchContext {
 impl<'a, H: Haystack> Matcher<'a, H> {
     /// Creates a new Matcher instance.
     pub fn new(nodes: &'a [AstNode], flags: &'a Flags, text: H, prefilter: &'a Prefilter) -> Self {
+        let mut subroutine_groups = HashMap::new();
+        collect_subroutine_groups(nodes, &mut subroutine_groups);
         Self {
             nodes,
             flags,
@@ -61,6 +70,8 @@ impl<'a, H: Haystack> Matcher<'a, H> {
             max_steps: flags
                 .max_backtrack_steps
                 .unwrap_or(DEFAULT_MAX_BACKTRACK_STEPS),
+            subroutine_groups,
+            subroutine_depth: Cell::new(0),
         }
     }
 
@@ -344,6 +355,67 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                         result
                     },
                 )
+            }
+            AstNode::Subroutine(target) => {
+                if self.subroutine_depth.get() >= MAX_SUBROUTINE_DEPTH {
+                    return None;
+                }
+                let (call_nodes, capture, index): (&[AstNode], bool, Option<usize>) = match target
+                {
+                    SubroutineTarget::Whole => (self.nodes, false, None),
+                    SubroutineTarget::Group(n) => match self.subroutine_groups.get(n) {
+                        Some(AstNode::Group {
+                            nodes,
+                            capture,
+                            index,
+                            ..
+                        }) => (nodes.as_slice(), *capture, *index),
+                        _ => return None,
+                    },
+                    // Resolved to `Group` by the parser before matching
+                    // ever runs - see `resolve_subroutines`.
+                    SubroutineTarget::Name(_) => return None,
+                };
+                let start_capture = pos;
+                self.subroutine_depth.set(self.subroutine_depth.get() + 1);
+                let result = self.match_nodes(
+                    call_nodes,
+                    pos,
+                    ctx,
+                    cursor,
+                    prev_char,
+                    &mut |next_pos, ctx, cursor, next_prev_char| {
+                        let saved = if capture
+                            && let Some(idx) = index
+                            && idx < ctx.captures.len()
+                        {
+                            let prev = ctx.captures[idx].clone();
+                            ctx.captures[idx] = Some(Match {
+                                start: start_capture,
+                                end: next_pos,
+                            });
+                            Some((idx, prev))
+                        } else {
+                            None
+                        };
+                        let result = self.match_nodes(
+                            remaining,
+                            next_pos,
+                            ctx,
+                            cursor,
+                            next_prev_char,
+                            cont,
+                        );
+                        if result.is_none()
+                            && let Some((idx, prev)) = saved
+                        {
+                            ctx.captures[idx] = prev;
+                        }
+                        result
+                    },
+                );
+                self.subroutine_depth.set(self.subroutine_depth.get() - 1);
+                result
             }
             AstNode::Backref(idx) => {
                 if let Some(Some(m)) = ctx.captures.get(*idx) {
@@ -1395,6 +1467,39 @@ fn analyze_prefilter(nodes: &[AstNode], flags: &Flags) -> Prefilter {
     }
 }
 
+fn collect_subroutine_groups<'a>(nodes: &'a [AstNode], map: &mut HashMap<usize, &'a AstNode>) {
+    for node in nodes {
+        match node {
+            AstNode::Group {
+                nodes: inner,
+                index,
+                ..
+            } => {
+                if let Some(i) = index {
+                    map.insert(*i, node);
+                }
+                collect_subroutine_groups(inner, map);
+            }
+            AstNode::Alternation(alts) => {
+                for alt in alts {
+                    collect_subroutine_groups(alt, map);
+                }
+            }
+            AstNode::ZeroOrMore { node, .. }
+            | AstNode::OneOrMore { node, .. }
+            | AstNode::Optional { node, .. }
+            | AstNode::Exact { node, .. }
+            | AstNode::Range { node, .. } => {
+                collect_subroutine_groups(std::slice::from_ref(node.as_ref()), map);
+            }
+            AstNode::LookAhead { nodes, .. } | AstNode::LookBehind { nodes, .. } => {
+                collect_subroutine_groups(nodes, map);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn node_has_choice_point(node: &AstNode) -> bool {
     match node {
         AstNode::Alternation(_) => true,
@@ -1402,6 +1507,7 @@ fn node_has_choice_point(node: &AstNode) -> bool {
         AstNode::ZeroOrMore { .. } | AstNode::OneOrMore { .. } | AstNode::Optional { .. } => true,
         AstNode::Exact { node, .. } => node_has_choice_point(node),
         AstNode::Range { node, min, max, .. } => max != &Some(*min) || node_has_choice_point(node),
+        AstNode::Subroutine(_) => true,
         _ => false,
     }
 }
@@ -1429,6 +1535,7 @@ fn node_mutates_ctx(node: &AstNode) -> bool {
         | AstNode::Optional { node, .. }
         | AstNode::Exact { node, .. }
         | AstNode::Range { node, .. } => node_mutates_ctx(node),
+        AstNode::Subroutine(_) => true,
         _ => false,
     }
 }
@@ -1471,6 +1578,6 @@ fn node_max_consumable_bytes(node: &AstNode) -> Option<usize> {
             }
             Some(best)
         }
-        AstNode::Backref(_) => None,
+        AstNode::Backref(_) | AstNode::Subroutine(_) => None,
     }
 }

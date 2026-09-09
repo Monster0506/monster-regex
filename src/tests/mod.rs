@@ -50,3 +50,7 @@ mod fuzz_oracle_linear;
 #[cfg(test)]
 #[path = "fuzz_oracle_streaming.rs"]
 mod fuzz_oracle_streaming;
+
+#[cfg(test)]
+#[path = "subroutine.rs"]
+mod subroutine;

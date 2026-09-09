@@ -1,4 +1,5 @@
 use crate::flags::Flags;
+use std::collections::HashMap;
 use std::fmt;
 
 /// Represents a node in the Abstract Syntax Tree (AST) of a regular expression.
@@ -96,6 +97,18 @@ pub enum AstNode {
         /// True for positive lookbehind, false for negative.
         positive: bool,
     },
+
+    Subroutine(SubroutineTarget),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubroutineTarget {
+    /// `(?R)` - recurse into the whole pattern.
+    Whole,
+    /// `(?N)`, or a `(?-N)`/`(?+N)` already resolved to an absolute number.
+    Group(usize),
+    /// `(?&name)` / `(?P>name)`, not yet resolved to a group number.
+    Name(String),
 }
 
 /// Represents a class of characters.
@@ -195,6 +208,7 @@ pub enum ParseError {
     InvalidGroup(String),
     /// A pattern nested groups/lookarounds more than `MAX_GROUP_DEPTH` deep.
     NestingTooDeep(usize),
+    InvalidSubroutineReference(String),
 }
 
 impl fmt::Display for ParseError {
@@ -232,6 +246,9 @@ impl fmt::Display for ParseError {
             ParseError::NestingTooDeep(max) => {
                 write!(f, "Pattern nests groups more than {} levels deep", max)
             }
+            ParseError::InvalidSubroutineReference(s) => {
+                write!(f, "Invalid subroutine reference: {}", s)
+            }
         }
     }
 }
@@ -252,7 +269,11 @@ impl Parser {
 
     /// Parses the pattern into an AST.
     pub fn parse(&mut self) -> Result<Vec<AstNode>, ParseError> {
-        self.parse_alternation()
+        let mut nodes = self.parse_alternation()?;
+        let mut names = HashMap::new();
+        collect_group_names(&nodes, &mut names);
+        resolve_subroutines(&mut nodes, &names, self.group_count)?;
+        Ok(nodes)
     }
 
     // Top level: handle |
@@ -601,6 +622,58 @@ impl Parser {
                     )),
                 }
             }
+            // Subroutine call: recurse the whole pattern `(?R)`.
+            Some(&'R') => {
+                self.consume()?;
+                self.expect_close_paren()?;
+                Ok(AstNode::Subroutine(SubroutineTarget::Whole))
+            }
+            // Subroutine call: named group `(?&name)`. Resolved to a group
+            // number in a post-parse pass - see `resolve_subroutines`.
+            Some(&'&') => {
+                self.consume()?;
+                let name = self.parse_group_name()?;
+                self.expect_close_paren()?;
+                Ok(AstNode::Subroutine(SubroutineTarget::Name(name)))
+            }
+            // Subroutine call, alternate named syntax: `(?P>name)`.
+            Some(&'P') => {
+                self.consume()?;
+                if self.current() != Some(&'>') {
+                    return Err(ParseError::InvalidGroup(
+                        "Expected '>' after ?P".to_string(),
+                    ));
+                }
+                self.consume()?;
+                let name = self.parse_group_name()?;
+                self.expect_close_paren()?;
+                Ok(AstNode::Subroutine(SubroutineTarget::Name(name)))
+            }
+            // Subroutine call: absolute group number `(?N)`.
+            Some(&c) if c.is_ascii_digit() => {
+                let n = self.parse_number()?;
+                self.expect_close_paren()?;
+                Ok(AstNode::Subroutine(SubroutineTarget::Group(n)))
+            }
+            Some(&sign @ ('-' | '+')) => {
+                self.consume()?;
+                let n = self.parse_number()?;
+                self.expect_close_paren()?;
+                let count = self.group_count as isize;
+                let target = if sign == '-' {
+                    count - (n as isize) + 1
+                } else {
+                    count + n as isize
+                };
+                if target < 1 {
+                    return Err(ParseError::InvalidSubroutineReference(format!(
+                        "(?{sign}{n}) has no target group"
+                    )));
+                }
+                Ok(AstNode::Subroutine(SubroutineTarget::Group(
+                    target as usize,
+                )))
+            }
             _ => Err(ParseError::InvalidGroup("Unknown extension ?".to_string())),
         }
     }
@@ -833,4 +906,81 @@ impl Parser {
             None => Err(ParseError::UnexpectedEof),
         }
     }
+}
+
+fn collect_group_names(nodes: &[AstNode], names: &mut HashMap<String, usize>) {
+    for node in nodes {
+        match node {
+            AstNode::Group {
+                nodes, name, index, ..
+            } => {
+                if let (Some(n), Some(i)) = (name, index) {
+                    names.insert(n.clone(), *i);
+                }
+                collect_group_names(nodes, names);
+            }
+            AstNode::Alternation(alts) => {
+                for alt in alts {
+                    collect_group_names(alt, names);
+                }
+            }
+            AstNode::ZeroOrMore { node, .. }
+            | AstNode::OneOrMore { node, .. }
+            | AstNode::Optional { node, .. }
+            | AstNode::Exact { node, .. }
+            | AstNode::Range { node, .. } => {
+                collect_group_names(std::slice::from_ref(node), names);
+            }
+            AstNode::LookAhead { nodes, .. } | AstNode::LookBehind { nodes, .. } => {
+                collect_group_names(nodes, names);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn resolve_subroutines(
+    nodes: &mut [AstNode],
+    names: &HashMap<String, usize>,
+    max_group: usize,
+) -> Result<(), ParseError> {
+    for node in nodes {
+        match node {
+            AstNode::Subroutine(target) => {
+                if let SubroutineTarget::Name(n) = target {
+                    let idx = names.get(n).copied().ok_or_else(|| {
+                        ParseError::InvalidSubroutineReference(format!(
+                            "no group named '{n}'"
+                        ))
+                    })?;
+                    *target = SubroutineTarget::Group(idx);
+                }
+                if let SubroutineTarget::Group(n) = target
+                    && (*n == 0 || *n > max_group)
+                {
+                    return Err(ParseError::InvalidSubroutineReference(format!(
+                        "reference to non-existent group {n}"
+                    )));
+                }
+            }
+            AstNode::Group { nodes, .. } => resolve_subroutines(nodes, names, max_group)?,
+            AstNode::Alternation(alts) => {
+                for alt in alts {
+                    resolve_subroutines(alt, names, max_group)?;
+                }
+            }
+            AstNode::ZeroOrMore { node, .. }
+            | AstNode::OneOrMore { node, .. }
+            | AstNode::Optional { node, .. }
+            | AstNode::Exact { node, .. }
+            | AstNode::Range { node, .. } => {
+                resolve_subroutines(std::slice::from_mut(node), names, max_group)?;
+            }
+            AstNode::LookAhead { nodes, .. } | AstNode::LookBehind { nodes, .. } => {
+                resolve_subroutines(nodes, names, max_group)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }

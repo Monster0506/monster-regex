@@ -281,7 +281,8 @@ fn fixed_length_node(node: &AstNode) -> Option<usize> {
         | AstNode::SetMatchEnd
         | AstNode::Backref(_)
         | AstNode::LookAhead { .. }
-        | AstNode::LookBehind { .. } => None,
+        | AstNode::LookBehind { .. }
+        | AstNode::Subroutine(_) => None,
     }
 }
 

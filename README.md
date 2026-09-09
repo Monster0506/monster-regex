@@ -392,3 +392,26 @@ Lookarounds assert that what follows or precedes the current position matches a 
 | `(?>!foo)` | Negative Lookahead | Matches if **not** followed by "foo". |
 | `(?<=foo)` | Positive Lookbehind | Matches if preceded by "foo". |
 | `(?<!foo)` | Negative Lookbehind | Matches if **not** preceded by "foo". |
+
+### Subroutine Calls (Recursion)
+A subroutine call re-executes another part of the pattern as a backtrackable sub-match at the current position, PCRE-style. 
+
+| Syntax | Meaning |
+| :--- | :--- |
+| `(?R)` | Recurse the whole pattern. |
+| `(?N)` | Call capture group *N*. |
+| `(?-N)` | Call the group *N* positions before this one (most recently opened). |
+| `(?+N)` | Call the group *N* positions after this one (not yet opened). |
+| `(?&name)` | Call the named group *name*. |
+| `(?P>name)` | Alternate syntax for `(?&name)`. |
+
+```rust
+use monster_regex::{Regex, Flags};
+
+fn main() {
+    let re = Regex::new(r"\((?:[^()]|(?R))*\)", Flags::default()).unwrap();
+    assert!(re.is_match("(a(b)c)"));
+}
+```
+
+A subroutine call is **not** a backreference: `\1` re-matches the *text* group 1 previously captured, while `(?1)` re-*executes* group 1's pattern and can match something different each time (`([a-z]+)-\1` matches `hello-hello`; `([a-z]+)-(?1)` also matches `hello-world`).
