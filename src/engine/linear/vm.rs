@@ -2104,7 +2104,6 @@ impl PikeVM {
         best_match
     }
 
-
     pub fn find_captures<H: Haystack>(
         &self,
         text: H,
@@ -2185,6 +2184,7 @@ impl PikeVM {
         best
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_epsilon_captures<H: Haystack>(
         nfa: &Nfa,
         list: &mut CaptureThreadList,

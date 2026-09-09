@@ -1,4 +1,3 @@
-
 use super::fuzz_oracle::{gen_haystack, gen_pattern};
 use crate::{Flags, Regex};
 use rand::SeedableRng;

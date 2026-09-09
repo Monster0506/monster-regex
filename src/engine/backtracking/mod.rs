@@ -695,7 +695,14 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                             if force_wider {
                                 return None;
                             }
-                            return self.match_nodes(remaining, next_pos, ctx, cursor, next_prev_char, cont);
+                            return self.match_nodes(
+                                remaining,
+                                next_pos,
+                                ctx,
+                                cursor,
+                                next_prev_char,
+                                cont,
+                            );
                         }
                         self.match_quantifier_optional(
                             node,
@@ -765,7 +772,14 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                             if force_wider {
                                 return None;
                             }
-                            return self.match_nodes(remaining, next_pos, ctx, cursor, next_prev_char, cont);
+                            return self.match_nodes(
+                                remaining,
+                                next_pos,
+                                ctx,
+                                cursor,
+                                next_prev_char,
+                                cont,
+                            );
                         }
                         self.match_quantifier_optional(
                             node,

@@ -110,7 +110,6 @@ fn test_fallback_api() {
     assert!(re.is_match("aa"));
 }
 
-
 #[test]
 fn test_linear_lazy_quantifier_prefers_minimum() {
     let re = Regex::new_linear("a??", Flags::default()).unwrap();

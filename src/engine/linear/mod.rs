@@ -126,7 +126,7 @@ impl LinearRegex {
             return LinearFindAllInner::Segments(iter);
         }
         if let Some(iter) = self.vm.find_all_bitparallel(text.as_bytes(), 0) {
-            return LinearFindAllInner::BitParallel(iter);
+            return LinearFindAllInner::BitParallel(Box::new(iter));
         }
         if let Some(iter) = self.vm.unicode_class_run_find_all(text.as_bytes(), 0) {
             return LinearFindAllInner::UnicodeClassRun(iter);
@@ -448,8 +448,8 @@ impl SegBits {
     }
     fn union(&self, other: &SegBits) -> SegBits {
         let mut r = [0u64; 4];
-        for i in 0..4 {
-            r[i] = self.0[i] | other.0[i];
+        for (i, slot) in r.iter_mut().enumerate() {
+            *slot = self.0[i] | other.0[i];
         }
         SegBits(r)
     }
@@ -896,7 +896,7 @@ enum LinearFindAllInner<'a> {
     MultiLiteral(vm::MultiLiteralFindAll<'a, 'a>),
     FixedLen(vm::FixedLenFindAll<'a, 'a>),
     Segments(vm::SegmentsFindAll<'a, 'a>),
-    BitParallel(vm::BitParallelFindAll<'a, 'a>),
+    BitParallel(Box<vm::BitParallelFindAll<'a, 'a>>),
     UnicodeClassRun(vm::UnicodeClassRunFindAll<'a, 'a>),
     Nfa(FindMatchesIterator<'a, &'a str>),
     Boundary(BoundaryFilter<'a, Box<LinearFindAllInner<'a>>>),
@@ -957,14 +957,10 @@ impl<'a, I: Iterator<Item = Match>> Iterator for BoundaryFilter<'a, I> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Match> {
-        for m in self.inner.by_ref() {
-            if vm::check_all_boundaries(self.leading, &self.text, m.start)
+        self.inner.by_ref().find(|m| {
+            vm::check_all_boundaries(self.leading, &self.text, m.start)
                 && vm::check_all_boundaries(self.trailing, &self.text, m.end)
-            {
-                return Some(m);
-            }
-        }
-        None
+        })
     }
 }
 

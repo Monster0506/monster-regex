@@ -107,7 +107,6 @@ fn test_dot() {
     assert!(re.is_match("\n"));
 }
 
-
 // --- 2. Quantifiers ---
 
 #[test]
@@ -618,7 +617,6 @@ fn test_replace_literal_dollar_sign() {
 }
 
 // --- 9. Complex Scenarios ---
-
 
 #[test]
 fn test_ipv4() {

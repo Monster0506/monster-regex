@@ -1,4 +1,3 @@
-
 use super::fuzz_oracle::{gen_haystack, gen_pattern};
 use super::streaming::ChunkedHaystack;
 use crate::{Flags, Regex};
