@@ -17,6 +17,7 @@ impl Compiler {
     }
 
     pub fn compile(mut self, nodes: &[AstNode]) -> Result<Nfa, CompileError> {
+        self.nfa.add_state(State::Jump(0));
         let (start, outs) = self.compile_slice(nodes)?;
         self.nfa.start = start;
 
@@ -140,13 +141,18 @@ impl Compiler {
 
                 Ok((start, all_outs))
             }
-            AstNode::ZeroOrMore { node, greedy: _ } => {
+            AstNode::ZeroOrMore { node, greedy } => {
                 let split = self.nfa.add_state(State::Split(0, 0));
                 let (s, outs) = self.compile_node(node)?;
 
-                // Patch Split(0) -> s
                 match &mut self.nfa.states[split] {
-                    State::Split(out1, _) => *out1 = s,
+                    State::Split(out1, out2) => {
+                        if *greedy {
+                            *out1 = s;
+                        } else {
+                            *out2 = s;
+                        }
+                    }
                     _ => unreachable!(),
                 }
 
@@ -154,24 +160,36 @@ impl Compiler {
                 self.patch(outs, split);
 
                 // Result start is split
-                // Result outs is [split] (the second leg of split)
+                // Result outs is [split] (whichever leg is still 0)
                 Ok((split, vec![split]))
             }
-            AstNode::OneOrMore { node, greedy: _ } => {
-                // Frag -> Split(Frag, Out)
+            AstNode::OneOrMore { node, greedy } => {
+                // Frag -> Split(loop-back, exit) if greedy, Split(exit,
+                // loop-back) if lazy - see `ZeroOrMore` above.
                 let (s, outs) = self.compile_node(node)?;
-                let split = self.nfa.add_state(State::Split(s, 0));
+                let split = if *greedy {
+                    self.nfa.add_state(State::Split(s, 0))
+                } else {
+                    self.nfa.add_state(State::Split(0, s))
+                };
                 self.patch(outs, split);
 
                 Ok((s, vec![split]))
             }
-            AstNode::Optional { node, greedy: _ } => {
-                // Split(Frag, Out)
+            AstNode::Optional { node, greedy } => {
+                // Split(Frag, Out) if greedy, Split(Out, Frag) if lazy - see
+                // `ZeroOrMore` above.
                 let split = self.nfa.add_state(State::Split(0, 0));
                 let (s, outs) = self.compile_node(node)?;
 
                 match &mut self.nfa.states[split] {
-                    State::Split(out1, _) => *out1 = s,
+                    State::Split(out1, out2) => {
+                        if *greedy {
+                            *out1 = s;
+                        } else {
+                            *out2 = s;
+                        }
+                    }
                     _ => unreachable!(),
                 }
 
@@ -242,7 +260,7 @@ impl Compiler {
                 node,
                 min,
                 max,
-                greedy: _,
+                greedy,
             } => {
                 // 1. Min required matches
                 // 2. Max optional matches
@@ -275,7 +293,11 @@ impl Compiler {
 
                         for i in 0..count {
                             let (node_start, node_outs) = self.compile_node(node)?;
-                            let split = self.nfa.add_state(State::Split(node_start, 0));
+                            let split = if *greedy {
+                                self.nfa.add_state(State::Split(node_start, 0))
+                            } else {
+                                self.nfa.add_state(State::Split(0, node_start))
+                            };
 
                             if i == 0 {
                                 start = split;
@@ -294,7 +316,13 @@ impl Compiler {
                     let (s, outs) = self.compile_node(node)?;
 
                     match &mut self.nfa.states[split] {
-                        State::Split(out1, _) => *out1 = s,
+                        State::Split(out1, out2) => {
+                            if *greedy {
+                                *out1 = s;
+                            } else {
+                                *out2 = s;
+                            }
+                        }
                         _ => unreachable!(),
                     }
                     self.patch(outs, split);

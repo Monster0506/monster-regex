@@ -6,14 +6,6 @@ use crate::flags::Flags;
 use crate::haystack::Haystack;
 pub use backtracking::Matcher;
 
-/// A pluggable regular expression engine.
-///
-/// This trait defines the full surface area required by Rift to perform
-/// searching, matching, and replacement, without committing to a specific
-/// regex implementation strategy (backtracking, NFA, DFA, hybrid, etc).
-///
-/// Implementors are expected to be immutable, thread-safe, and cheaply cloneable
-/// (usually via Arc internally).
 pub trait RegexEngine: Send + Sync + 'static {
     /// The compiled regex type produced by this engine.
     type Regex: CompiledRegex;
@@ -22,10 +14,6 @@ pub trait RegexEngine: Send + Sync + 'static {
     fn compile(&self, pattern: &str, flags: Flags) -> Result<Self::Regex, CompileError>;
 }
 
-/// A compiled regular expression.
-///
-/// This trait is object-safe so that compiled regexes may be stored behind
-/// trait objects if necessary.
 pub trait CompiledRegex: Send + Sync {
     /// Returns the original pattern string.
     fn pattern(&self) -> &str;
@@ -93,9 +81,6 @@ impl CompiledRegex for Box<dyn CompiledRegex> {
     }
 }
 
-/// A compiled regular expression that supports streaming/generic haystacks.
-///
-/// This trait contains methods that are not object-safe due to generics.
 pub trait CompiledRegexHaystack: CompiledRegex {
     /// Returns true if the regex matches anywhere in the haystack.
     fn is_match_from<H: Haystack>(&self, haystack: H) -> bool;
@@ -113,10 +98,6 @@ pub trait CompiledRegexHaystack: CompiledRegex {
     ) -> Box<dyn Iterator<Item = Match> + 'a>;
 }
 
-/// A wrapper for any RegexEngine that type-erases the compiled regex.
-///
-/// This allows different engines to be used interchangeably as trait objects
-/// where the associated `Regex` type is `Box<dyn CompiledRegex>`.
 pub struct AnyRegexEngine<E: RegexEngine>(pub E);
 
 impl<E: RegexEngine> RegexEngine for AnyRegexEngine<E>

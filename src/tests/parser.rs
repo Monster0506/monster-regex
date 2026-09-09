@@ -24,6 +24,14 @@ fn test_quantifiers() {
 }
 
 #[test]
+fn test_chained_quantifier() {
+    let mut p = Parser::new(".{2}{0}", Flags::default());
+    let ast = p.parse().unwrap();
+    assert_eq!(ast.len(), 1, "should collapse into one quantified node, not a node plus leftover literals");
+    assert!(matches!(ast[0], AstNode::Exact { count: 0, .. }));
+}
+
+#[test]
 fn test_char_class() {
     let mut p = Parser::new("[a-z]", Flags::default());
     let ast = p.parse().unwrap();

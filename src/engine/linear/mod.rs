@@ -76,10 +76,7 @@ pub struct LinearRegex {
     vm: PikeVM,
     pattern: String,
     flags: Flags,
-    // Reserved for capture-group support (not yet read by the linear engine).
-    #[allow(dead_code)]
     group_count: usize,
-    #[allow(dead_code)]
     named_groups: HashMap<String, usize>,
 }
 
@@ -87,52 +84,58 @@ impl LinearRegex {
     /// Concrete, stack-allocated find-all iterator (no heap allocation for literal patterns).
     pub fn find_all_linear<'a>(&'a self, text: &'a str) -> LinearFindAll<'a> {
         let inner = self.find_all_linear_unwrapped(text);
-        if self.vm.has_boundary() {
-            return LinearFindAll::Boundary(BoundaryFilter {
+        let inner = if self.vm.has_boundary() {
+            LinearFindAllInner::Boundary(BoundaryFilter {
                 inner: Box::new(inner),
                 text,
                 leading: self.vm.leading_boundary(),
                 trailing: self.vm.trailing_boundary(),
-            });
+            })
+        } else {
+            inner
+        };
+        LinearFindAll {
+            inner,
+            adjacent_empty: Default::default(),
         }
-        inner
     }
 
-    fn find_all_linear_unwrapped<'a>(&'a self, text: &'a str) -> LinearFindAll<'a> {
+    fn find_all_linear_unwrapped<'a>(&'a self, text: &'a str) -> LinearFindAllInner<'a> {
         if let Some(iter) = self.vm.multi_literal_find_all(text.as_bytes(), 0) {
-            return LinearFindAll::MultiLiteral(iter);
+            return LinearFindAllInner::MultiLiteral(iter);
         }
         if let Some(lit) = self.vm.literal() {
             if !lit.case_insensitive {
                 // CS: single FindIter streams through the whole document.
-                return LinearFindAll::Literal {
+                return LinearFindAllInner::Literal {
                     inner: lit.finder.find_iter(text.as_bytes()),
                     lit_len: lit.len(),
                 };
             }
             // CI: memchr2 on first byte + verify (existing path).
             if let Some(iter) = self.vm.literal_find_all(text.as_bytes(), 0) {
-                return LinearFindAll::LiteralCI(iter);
+                return LinearFindAllInner::LiteralCI(iter);
             }
         }
         if let Some(fixed_len) = self.vm.fixed_len()
             && let Some(iter) = self.vm.find_all_fixed_len(text.as_bytes(), 0, fixed_len)
         {
-            return LinearFindAll::FixedLen(iter);
+            return LinearFindAllInner::FixedLen(iter);
         }
         if let Some(iter) = self.vm.find_all_segments(text.as_bytes(), 0) {
-            return LinearFindAll::Segments(iter);
+            return LinearFindAllInner::Segments(iter);
         }
         if let Some(iter) = self.vm.find_all_bitparallel(text.as_bytes(), 0) {
-            return LinearFindAll::BitParallel(iter);
+            return LinearFindAllInner::BitParallel(iter);
         }
         if let Some(iter) = self.vm.unicode_class_run_find_all(text.as_bytes(), 0) {
-            return LinearFindAll::UnicodeClassRun(iter);
+            return LinearFindAllInner::UnicodeClassRun(iter);
         }
-        LinearFindAll::Nfa(FindMatchesIterator {
+        LinearFindAllInner::Nfa(FindMatchesIterator {
             text,
             regex: self,
             last_end: 0,
+            adjacent_empty: Default::default(),
         })
     }
 
@@ -149,13 +152,9 @@ impl LinearRegex {
 
         let (group_count, named_groups) = analyze_captures(&ast);
 
-        // Boundary-wrapper fast path: `\bfoo\b`-shaped patterns where the
-        // core has no internal assertions and qualifies for a deterministic
-        // fast path (literal / fixed-length / disjoint-segments - each
-        // guarantees exactly one possible match per start position) can
-        // skip NFA-level assertion handling entirely and verify the
-        // assertion as an O(1) postcondition instead (see `BoundaryKind`).
-        if let Some((leading, core, trailing)) = split_boundary_wrapper(&ast) {
+        let has_captures = group_count > 0;
+
+        if !has_captures && let Some((leading, core, trailing)) = split_boundary_wrapper(&ast) {
             let core_start_filter = analyze_start_filter(core, &flags);
             let core_fixed_len = fixed_length(core);
             let core_segments = disjoint_greedy_segments(core, &flags);
@@ -174,6 +173,7 @@ impl LinearRegex {
                     core_literal,
                     core_fixed_len,
                     core_segments,
+                    priority_safe(core),
                 )
                 .with_boundary(leading, trailing);
                 if let Some(literals) = core_multi_literal {
@@ -188,28 +188,52 @@ impl LinearRegex {
                     named_groups,
                 });
             }
-            // Core doesn't qualify for any deterministic fast path -
-            // correctness needs full assertion-aware simulation, so fall
-            // through and compile the original, unstripped pattern below.
         }
 
         let start_filter = analyze_start_filter(&ast, &flags);
-        let fixed_len = fixed_length(&ast);
-        let segments = disjoint_greedy_segments(&ast, &flags);
+        let fixed_len = if has_captures {
+            None
+        } else {
+            fixed_length(&ast)
+        };
+        let segments = if has_captures {
+            None
+        } else {
+            disjoint_greedy_segments(&ast, &flags)
+        };
 
         let compiler = Compiler::new(flags);
         let nfa = compiler.compile(&ast)?;
 
-        let literal = extract_literal(&nfa);
+        let literal = if has_captures {
+            None
+        } else {
+            extract_literal(&nfa)
+        };
 
-        let mut vm = PikeVM::new(nfa, start_filter, literal, fixed_len, segments);
-        if let Some(literals) = alternation_of_literals(&ast) {
-            let ic = flags.ignore_case.unwrap_or(false);
-            vm = vm.with_multi_literal(vm::MultiLiteral::new(literals, ic));
-        }
-        if let Some((class, min, max)) = unicode_class_run(&ast) {
-            let ic = flags.ignore_case.unwrap_or(false);
-            vm = vm.with_unicode_class_run(vm::UnicodeClassRun::new(class, ic, flags.dotall, min, max));
+        let mut vm = PikeVM::new(
+            nfa,
+            start_filter,
+            literal,
+            fixed_len,
+            segments,
+            priority_safe(&ast),
+        );
+        if !has_captures {
+            if let Some(literals) = alternation_of_literals(&ast) {
+                let ic = flags.ignore_case.unwrap_or(false);
+                vm = vm.with_multi_literal(vm::MultiLiteral::new(literals, ic));
+            }
+            if let Some((class, min, max)) = unicode_class_run(&ast) {
+                let ic = flags.ignore_case.unwrap_or(false);
+                vm = vm.with_unicode_class_run(vm::UnicodeClassRun::new(
+                    class,
+                    ic,
+                    flags.dotall,
+                    min,
+                    max,
+                ));
+            }
         }
 
         Ok(LinearRegex {
@@ -223,9 +247,9 @@ impl LinearRegex {
 }
 
 fn fixed_length(nodes: &[AstNode]) -> Option<usize> {
-    nodes.iter().try_fold(0usize, |acc, n| {
-        Some(acc + fixed_length_node(n)?)
-    })
+    nodes
+        .iter()
+        .try_fold(0usize, |acc, n| Some(acc + fixed_length_node(n)?))
 }
 
 fn fixed_length_node(node: &AstNode) -> Option<usize> {
@@ -261,13 +285,6 @@ fn fixed_length_node(node: &AstNode) -> Option<usize> {
     }
 }
 
-/// Maps a top-level assertion node to the subset of zero-width assertions
-/// the boundary-wrapper fast path (see `split_boundary_wrapper`) can verify
-/// as an O(1) postcondition. `StartAnchor`/`EndAnchor` (position-0/
-/// position-len, possibly multiline) and `SetMatchStart`/`SetMatchEnd`
-/// (which redefine the reported match bounds, not just gate whether a match
-/// exists) are deliberately excluded - patterns using those still compile
-/// through the general path below.
 fn boundary_kind(node: &AstNode) -> Option<vm::BoundaryKind> {
     match node {
         AstNode::WordBoundary => Some(vm::BoundaryKind::WordBoundary),
@@ -296,11 +313,6 @@ fn contains_assertion(nodes: &[AstNode]) -> bool {
     })
 }
 
-/// Detects `[leading \b/\</\>]* core [trailing \b/\</\>]*`, where `core`
-/// contains no zero-width assertions anywhere (recursively) - i.e. the
-/// assertions appear only as a prefix and/or suffix run at the pattern's top
-/// level. Returns `None` if the pattern doesn't have this shape, has no
-/// wrapping assertions at all, or the leftover "core" is empty.
 fn split_boundary_wrapper(
     nodes: &[AstNode],
 ) -> Option<(Vec<vm::BoundaryKind>, &[AstNode], Vec<vm::BoundaryKind>)> {
@@ -337,12 +349,37 @@ fn split_boundary_wrapper(
     Some((leading, core, trailing))
 }
 
-/// If `nodes` is exactly one `Alternation` node where every branch is a
-/// non-empty sequence of ASCII `Literal` chars, returns the branch byte
-/// strings - routes `GET|POST|PUT|DELETE`-shaped patterns to the
-/// `MultiLiteral` fast path instead of general NFA simulation. Branch count
-/// is capped (see `MultiLiteral`'s doc comment): this is a linear
-/// per-candidate scan, not a substitute for a real trie at scale.
+fn priority_safe(nodes: &[AstNode]) -> bool {
+    fn safe(nodes: &[AstNode], nested_variable: bool) -> bool {
+        nodes.iter().all(|n| match n {
+            AstNode::Alternation(_) => false,
+            AstNode::Group { nodes, .. } => safe(nodes, nested_variable),
+            AstNode::ZeroOrMore { node, greedy } | AstNode::OneOrMore { node, greedy } => {
+                *greedy && !nested_variable && safe(std::slice::from_ref(node), true)
+            }
+            AstNode::Optional { node, greedy } => {
+                *greedy && !nested_variable && safe(std::slice::from_ref(node), true)
+            }
+            AstNode::Range {
+                node,
+                greedy,
+                min,
+                max,
+            } => {
+                if *max == Some(*min) {
+                    // Exact-equivalent: no choice of its own, transparent.
+                    safe(std::slice::from_ref(node), nested_variable)
+                } else {
+                    *greedy && !nested_variable && safe(std::slice::from_ref(node), true)
+                }
+            }
+            AstNode::Exact { node, .. } => safe(std::slice::from_ref(node), nested_variable),
+            _ => true,
+        })
+    }
+    safe(nodes, false)
+}
+
 fn alternation_of_literals(nodes: &[AstNode]) -> Option<Vec<Box<[u8]>>> {
     let [AstNode::Alternation(alts)] = nodes else {
         return None;
@@ -367,13 +404,6 @@ fn alternation_of_literals(nodes: &[AstNode]) -> Option<Vec<Box<[u8]>>> {
     Some(out)
 }
 
-/// If `nodes` is exactly one quantified (greedy) character class - `\w+`,
-/// `\W*`, `\s{2,5}`, ... - with nothing else, and that class isn't
-/// ASCII-only (see `class_is_ascii_only` - ASCII-only classes are already
-/// covered by the faster `bp_nfa_ascii` byte-table path whenever the
-/// haystack turns out to be ASCII), returns `(class, min, max)` for the
-/// `UnicodeClassRun` fast path. Lazy quantifiers are excluded (shortest-
-/// match semantics, not what a greedy scan computes).
 fn unicode_class_run(nodes: &[AstNode]) -> Option<(CharClass, usize, Option<usize>)> {
     let [node] = nodes else { return None };
     let (inner, min, max, greedy) = match node {
@@ -490,24 +520,6 @@ fn disjoint_greedy_segments(nodes: &[AstNode], flags: &Flags) -> Option<Vec<Segm
         segs.push(Segment { alphabet, min, max });
     }
 
-    // Ambiguity check. `reachable` is the union of alphabets that could sit
-    // immediately before the segment currently being examined; `active`
-    // means that set is actually meaningful (`false` means the current
-    // position is deterministically pinned, so nothing needs checking).
-    //
-    // Only a segment with genuine length flexibility (`min != max`) can ever
-    // create backtracking ambiguity, by greedily consuming bytes a
-    // neighboring segment actually needed. A fixed-count segment (a bare
-    // literal/class, or `{n}`) always consumes exactly that many bytes, no
-    // more or fewer, so it can neither "steal" from a neighbor nor be stolen
-    // from - once one is passed, the position is unambiguous again
-    // regardless of alphabet overlap on either side. This is what lets a
-    // trailing `.*` (near-universal alphabet) qualify after a fixed literal
-    // like `: ` even though `.` overlaps with nearly everything: the literal
-    // in front of it can't have consumed any of `.*`'s territory.
-    //
-    // A degenerate `{0}` segment consumes nothing, ever - fully transparent,
-    // skipped entirely rather than participating in either role.
     let mut reachable = SegBits::empty();
     let mut active = false;
     for seg in &segs {
@@ -530,9 +542,6 @@ fn disjoint_greedy_segments(nodes: &[AstNode], flags: &Flags) -> Option<Vec<Segm
             };
             active = true;
         } else {
-            // Mandatory but variable-length: guaranteed to be the immediate
-            // predecessor for whatever comes next, discarding any earlier
-            // ambiguity chain.
             reachable = seg.alphabet;
             active = true;
         }
@@ -561,9 +570,10 @@ fn collect_start_bytes(node: &AstNode, ic: bool) -> Vec<u8> {
             negated: false,
         }) => extract_bytes_from_ranges(chars, ic),
         AstNode::CharClass(_) => vec![],
-        AstNode::OneOrMore { node, .. } | AstNode::Exact { node, .. } => {
-            collect_start_bytes(node, ic)
-        }
+        AstNode::OneOrMore { node, .. } => collect_start_bytes(node, ic),
+        // See `start_filter_from_class`: `{0}` never actually requires the
+        // wrapped node to appear, so it can't license a start-byte filter.
+        AstNode::Exact { node, count } if *count > 0 => collect_start_bytes(node, ic),
         AstNode::Group { nodes, .. } => {
             if nodes.is_empty() {
                 vec![]
@@ -571,10 +581,6 @@ fn collect_start_bytes(node: &AstNode, ic: bool) -> Vec<u8> {
                 collect_start_bytes(&nodes[0], ic)
             }
         }
-        // A match can start with any byte that could start any branch. If a
-        // branch is empty (matches the empty string) or its own start set
-        // can't be narrowed, no useful filter can be derived for the whole
-        // alternation - bail out (empty result -> `StartFilter::None`).
         AstNode::Alternation(alts) => {
             let mut bytes = Vec::new();
             for alt in alts {
@@ -622,14 +628,6 @@ fn extract_bytes_from_ranges(ranges: &[CharRange], ic: bool) -> Vec<u8> {
 }
 
 fn analyze_start_filter(nodes: &[AstNode], flags: &Flags) -> StartFilter {
-    // A leading zero-width assertion (`\b`, `\<`, `\>`, `^`, `$`, `\zs`, `\ze`)
-    // doesn't consume anything, so the match's actual start position is
-    // wherever the *first real atom after it* begins - e.g. for `\bfoo\b`,
-    // every match starts exactly where the `f` is. Skipping past these to
-    // find that atom doesn't change correctness (the assertion is still
-    // fully checked by the general engine at each candidate position; this
-    // only decides which positions are worth trying), but it's the
-    // difference between using a `memchr`-based filter at all and using none.
     let Some(first) = nodes.iter().find(|n| !is_zero_width_assertion(n)) else {
         return StartFilter::None;
     };
@@ -652,9 +650,6 @@ fn analyze_start_filter(nodes: &[AstNode], flags: &Flags) -> StartFilter {
     }
 }
 
-/// True for zero-width assertions that never consume a byte, regardless of
-/// position (position-*dependent* zero-width nodes like `\b` still qualify -
-/// they just don't advance the cursor when they hold).
 fn is_zero_width_assertion(node: &AstNode) -> bool {
     matches!(
         node,
@@ -672,7 +667,10 @@ fn is_zero_width_assertion(node: &AstNode) -> bool {
 fn start_filter_from_class(node: &AstNode) -> Option<StartFilter> {
     let class = match node {
         AstNode::CharClass(c) => c,
-        AstNode::OneOrMore { node, .. } | AstNode::Exact { node, .. } => {
+        AstNode::OneOrMore { node, .. } => {
+            return start_filter_from_class(node);
+        }
+        AstNode::Exact { node, count } if *count > 0 => {
             return start_filter_from_class(node);
         }
         AstNode::Group { nodes, .. } => {
@@ -776,19 +774,46 @@ impl CompiledRegex for LinearRegex {
     }
 
     fn find_all<'a>(&'a self, text: &'a str) -> Box<dyn Iterator<Item = Match> + 'a> {
-        // Delegates to the concrete, boundary-aware dispatcher instead of
-        // duplicating its fast-path priority order (and, previously,
-        // omitting the boundary-wrapper postcondition entirely - see
-        // `find_all_linear`).
         Box::new(self.find_all_linear(text))
     }
 
     fn captures(&self, text: &str) -> Option<Captures> {
-        let full = self.vm.find_raw(text, 0)?;
+        if self.group_count == 0 {
+            let full = self.vm.find_raw(text, 0)?;
+            return Some(Captures {
+                full_match: full,
+                groups: vec![],
+                named: HashMap::new(),
+            });
+        }
+        let num_slots = 2 * (self.group_count + 1);
+        let (full_match, slots) = self.vm.find_captures(text, 0, num_slots)?;
+        let groups: Vec<Option<Match>> = (1..=self.group_count)
+            .map(|i| {
+                match (
+                    slots.get(2 * i).copied().flatten(),
+                    slots.get(2 * i + 1).copied().flatten(),
+                ) {
+                    (Some(start), Some(end)) => Some(Match { start, end }),
+                    _ => None,
+                }
+            })
+            .collect();
+        let named = self
+            .named_groups
+            .iter()
+            .filter_map(|(name, &idx)| {
+                groups
+                    .get(idx - 1)
+                    .cloned()
+                    .flatten()
+                    .map(|m| (name.clone(), m))
+            })
+            .collect();
         Some(Captures {
-            full_match: full,
-            groups: vec![],
-            named: HashMap::new(),
+            full_match,
+            groups,
+            named,
         })
     }
 
@@ -797,14 +822,20 @@ impl CompiledRegex for LinearRegex {
             text,
             regex: self,
             last_end: 0,
+            adjacent_empty: Default::default(),
         })
     }
 
     fn replace(&self, text: &str, replacement: &str) -> String {
-        if let Some(m) = self.find(text) {
+        if let Some(caps) = self.captures(text) {
+            let m = caps.full_match.clone();
             let mut result = String::with_capacity(text.len());
             result.push_str(&text[..m.start]);
-            result.push_str(replacement);
+            result.push_str(&crate::captures::expand_replacement(
+                &caps,
+                replacement,
+                text,
+            ));
             result.push_str(&text[m.end..]);
             result
         } else {
@@ -815,9 +846,14 @@ impl CompiledRegex for LinearRegex {
     fn replace_all(&self, text: &str, replacement: &str) -> String {
         let mut result = String::with_capacity(text.len() * 2);
         let mut last_end = 0;
-        for m in self.find_all(text) {
+        for caps in self.captures_all(text) {
+            let m = caps.full_match.clone();
             result.push_str(&text[last_end..m.start]);
-            result.push_str(replacement);
+            result.push_str(&crate::captures::expand_replacement(
+                &caps,
+                replacement,
+                text,
+            ));
             last_end = m.end;
         }
         result.push_str(&text[last_end..]);
@@ -846,11 +882,12 @@ impl crate::engine::CompiledRegexHaystack for LinearRegex {
             text: haystack,
             regex: self,
             last_end: 0,
+            adjacent_empty: Default::default(),
         })
     }
 }
 
-pub enum LinearFindAll<'a> {
+enum LinearFindAllInner<'a> {
     Literal {
         inner: memchr::memmem::FindIter<'a, 'a>,
         lit_len: usize,
@@ -862,14 +899,10 @@ pub enum LinearFindAll<'a> {
     BitParallel(vm::BitParallelFindAll<'a, 'a>),
     UnicodeClassRun(vm::UnicodeClassRunFindAll<'a, 'a>),
     Nfa(FindMatchesIterator<'a, &'a str>),
-    /// Postcondition-filtered wrapper for boundary-wrapper patterns (see
-    /// `split_boundary_wrapper`). One allocation per `find_all_linear` call
-    /// (to box the otherwise-recursive `LinearFindAll` payload), not per
-    /// match.
-    Boundary(BoundaryFilter<'a, Box<LinearFindAll<'a>>>),
+    Boundary(BoundaryFilter<'a, Box<LinearFindAllInner<'a>>>),
 }
 
-impl<'a> Iterator for LinearFindAll<'a> {
+impl<'a> Iterator for LinearFindAllInner<'a> {
     type Item = Match;
 
     #[inline]
@@ -894,13 +927,25 @@ impl<'a> Iterator for LinearFindAll<'a> {
     }
 }
 
-/// Wraps an inner match iterator, filtering out candidates that fail the
-/// leading/trailing boundary postcondition (see `BoundaryKind`). Correct
-/// without any special retry logic: rejected candidates are simply skipped,
-/// and the inner iterator naturally resumes scanning from that candidate's
-/// end - safe because a boundary wrapper is only ever attached when the
-/// core has exactly one possible match per start position, so there's no
-/// alternative shorter match at a rejected start to miss.
+pub struct LinearFindAll<'a> {
+    inner: LinearFindAllInner<'a>,
+    adjacent_empty: crate::captures::AdjacentEmptyFilter,
+}
+
+impl<'a> Iterator for LinearFindAll<'a> {
+    type Item = Match;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let m = self.inner.next()?;
+            if self.adjacent_empty.should_suppress(m.start, m.end) {
+                continue;
+            }
+            return Some(m);
+        }
+    }
+}
+
 pub struct BoundaryFilter<'a, I> {
     inner: I,
     text: &'a str,
@@ -927,18 +972,24 @@ pub struct FindMatchesIterator<'a, H: Haystack> {
     pub(crate) text: H,
     pub(crate) regex: &'a LinearRegex,
     pub(crate) last_end: usize,
+    pub(crate) adjacent_empty: crate::captures::AdjacentEmptyFilter,
 }
 
 impl<'a, H: Haystack> Iterator for FindMatchesIterator<'a, H> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.last_end > self.text.len() {
-            return None;
+        loop {
+            if self.last_end > self.text.len() {
+                return None;
+            }
+            let m = self.regex.find_from_at(self.text, self.last_end)?;
+            self.last_end = m.end.max(m.start + 1);
+            if self.adjacent_empty.should_suppress(m.start, m.end) {
+                continue;
+            }
+            return Some(m);
         }
-        let m = self.regex.find_from_at(self.text, self.last_end)?;
-        self.last_end = m.end.max(m.start + 1);
-        Some(m)
     }
 }
 
@@ -946,29 +997,38 @@ struct CapturesIterator<'a> {
     text: &'a str,
     regex: &'a LinearRegex,
     last_end: usize,
+    adjacent_empty: crate::captures::AdjacentEmptyFilter,
 }
 
 impl<'a> Iterator for CapturesIterator<'a> {
     type Item = Captures;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.last_end > self.text.len() {
-            return None;
+        loop {
+            if self.last_end > self.text.len() {
+                return None;
+            }
+            let slice = &self.text[self.last_end..];
+            let mut caps = self.regex.captures(slice)?;
+            let offset = self.last_end;
+            caps.full_match.start += offset;
+            caps.full_match.end += offset;
+            for g in caps.groups.iter_mut().flatten() {
+                g.start += offset;
+                g.end += offset;
+            }
+            for g in caps.named.values_mut() {
+                g.start += offset;
+                g.end += offset;
+            }
+            self.last_end = caps.full_match.end.max(caps.full_match.start + 1);
+            if self
+                .adjacent_empty
+                .should_suppress(caps.full_match.start, caps.full_match.end)
+            {
+                continue;
+            }
+            return Some(caps);
         }
-        let slice = &self.text[self.last_end..];
-        let mut caps = self.regex.captures(slice)?;
-        let offset = self.last_end;
-        caps.full_match.start += offset;
-        caps.full_match.end += offset;
-        for g in caps.groups.iter_mut().flatten() {
-            g.start += offset;
-            g.end += offset;
-        }
-        for g in caps.named.values_mut() {
-            g.start += offset;
-            g.end += offset;
-        }
-        self.last_end = caps.full_match.end.max(caps.full_match.start + 1);
-        Some(caps)
     }
 }

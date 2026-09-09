@@ -5,13 +5,7 @@ use crate::engine::{CompiledRegex, CompiledRegexHaystack, RegexEngine};
 use crate::errors::CompileError;
 use crate::flags::Flags;
 use crate::haystack::Haystack;
-// use crate::parser::AstNode;
-// BacktrackingRegex exposes ast, compiled linear regex exposes nfa.
-// Regex struct just holds compiled.
 
-/// A compiled regular expression.
-///
-/// This struct represents a parsed and compiled regex pattern, ready to be used for matching against text.
 pub struct Regex<E: RegexEngine = BacktrackingRegexEngine> {
     compiled: E::Regex,
 }
@@ -38,10 +32,6 @@ impl Regex<LinearRegexEngine> {
         Ok(Regex { compiled })
     }
 
-    /// Returns an iterator over all non-overlapping matches.
-    ///
-    /// Returns a stack-allocated concrete type - no heap allocation for pure-literal
-    /// patterns, no vtable dispatch per match.
     pub fn find_all<'a>(&'a self, text: &'a str) -> crate::engine::linear::LinearFindAll<'a> {
         self.compiled.find_all_linear(text)
     }
@@ -91,6 +81,7 @@ impl<E: RegexEngine> Regex<E> {
             text,
             regex: self,
             last_end: 0,
+            adjacent_empty: Default::default(),
         }
     }
 
@@ -105,6 +96,7 @@ impl<E: RegexEngine> Regex<E> {
             text,
             regex: self,
             last_end: 0,
+            adjacent_empty: Default::default(),
         }
     }
 
@@ -134,6 +126,7 @@ pub struct FindMatchesIterator<'a, H: Haystack, E: RegexEngine> {
     text: H,
     regex: &'a Regex<E>,
     last_end: usize,
+    adjacent_empty: crate::captures::AdjacentEmptyFilter,
 }
 
 impl<'a, H: Haystack, E: RegexEngine> Iterator for FindMatchesIterator<'a, H, E>
@@ -143,12 +136,17 @@ where
     type Item = Match;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.last_end > self.text.len() {
-            return None;
+        loop {
+            if self.last_end > self.text.len() {
+                return None;
+            }
+            let m = self.regex.find_from_at(self.text, self.last_end)?;
+            self.last_end = m.end.max(m.start + 1);
+            if self.adjacent_empty.should_suppress(m.start, m.end) {
+                continue;
+            }
+            return Some(m);
         }
-        let m = self.regex.find_from_at(self.text, self.last_end)?;
-        self.last_end = m.end.max(m.start + 1);
-        Some(m)
     }
 }
 
@@ -157,22 +155,31 @@ pub struct FindAllIterator<'a, E: RegexEngine> {
     text: &'a str,
     regex: &'a Regex<E>,
     last_end: usize,
+    adjacent_empty: crate::captures::AdjacentEmptyFilter,
 }
 
 impl<'a, E: RegexEngine> Iterator for FindAllIterator<'a, E> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.last_end > self.text.len() {
-            return None;
+        loop {
+            if self.last_end > self.text.len() {
+                return None;
+            }
+            let m = self.regex.find(&self.text[self.last_end..])?;
+            let adjusted = Match {
+                start: self.last_end + m.start,
+                end: self.last_end + m.end,
+            };
+            self.last_end = adjusted.end.max(adjusted.start + 1);
+            if self
+                .adjacent_empty
+                .should_suppress(adjusted.start, adjusted.end)
+            {
+                continue;
+            }
+            return Some(adjusted);
         }
-        let m = self.regex.find(&self.text[self.last_end..])?;
-        let adjusted = Match {
-            start: self.last_end + m.start,
-            end: self.last_end + m.end,
-        };
-        self.last_end = adjusted.end.max(adjusted.start + 1);
-        Some(adjusted)
     }
 }
 
@@ -181,33 +188,42 @@ pub struct CapturesIterator<'a, E: RegexEngine> {
     text: &'a str,
     regex: &'a Regex<E>,
     last_end: usize,
+    adjacent_empty: crate::captures::AdjacentEmptyFilter,
 }
 
 impl<'a, E: RegexEngine> Iterator for CapturesIterator<'a, E> {
     type Item = Captures;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.last_end > self.text.len() {
-            return None;
-        }
-        let caps = self.regex.captures(&self.text[self.last_end..])?;
-        let offset = self.last_end;
-        self.last_end = offset + caps.full_match.end;
-        self.last_end = self.last_end.max(offset + caps.full_match.start + 1);
+        loop {
+            if self.last_end > self.text.len() {
+                return None;
+            }
+            let caps = self.regex.captures(&self.text[self.last_end..])?;
+            let offset = self.last_end;
+            self.last_end = offset + caps.full_match.end;
+            self.last_end = self.last_end.max(offset + caps.full_match.start + 1);
 
-        // Adjust all match positions by offset
-        let mut adjusted_caps = caps;
-        adjusted_caps.full_match.start += offset;
-        adjusted_caps.full_match.end += offset;
-        for m in &mut adjusted_caps.groups.iter_mut().flatten() {
-            m.start += offset;
-            m.end += offset;
-        }
-        for m in adjusted_caps.named.values_mut() {
-            m.start += offset;
-            m.end += offset;
-        }
+            // Adjust all match positions by offset
+            let mut adjusted_caps = caps;
+            adjusted_caps.full_match.start += offset;
+            adjusted_caps.full_match.end += offset;
+            for m in &mut adjusted_caps.groups.iter_mut().flatten() {
+                m.start += offset;
+                m.end += offset;
+            }
+            for m in adjusted_caps.named.values_mut() {
+                m.start += offset;
+                m.end += offset;
+            }
 
-        Some(adjusted_caps)
+            if self
+                .adjacent_empty
+                .should_suppress(adjusted_caps.full_match.start, adjusted_caps.full_match.end)
+            {
+                continue;
+            }
+            return Some(adjusted_caps);
+        }
     }
 }

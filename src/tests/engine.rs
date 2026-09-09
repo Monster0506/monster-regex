@@ -107,9 +107,6 @@ fn test_dot() {
     assert!(re.is_match("\n"));
 }
 
-// Smartcase is not fully implemented in the engine (defaults to case-sensitive if ignore_case is None)
-// #[test]
-// fn test_smartcase() { ... }
 
 // --- 2. Quantifiers ---
 
@@ -351,6 +348,11 @@ fn test_match_boundaries_zs_ze() {
     assert_find("foo\\zsbar\\zebaz", "foobarbaz", "bar");
 }
 
+#[test]
+fn test_zs_reverts_on_backtrack_past_it() {
+    assert_find(r"(?:a\zsb){1,2}abY", "ababY", "babY");
+}
+
 // --- 5. Flags ---
 
 #[test]
@@ -464,12 +466,13 @@ fn test_lookbehind() {
 }
 
 #[test]
+fn test_capture_inside_lookaround_visible_afterward() {
+    assert_find(r"(?>=(a))\1", "aa", "a");
+    assert_find(r"(a)(?<=(a))\2", "aa", "aa");
+}
+
+#[test]
 fn test_lookbehind_large_input_is_linear() {
-    // Regression guard: a bounded-length lookbehind must not rescan from the
-    // string start at every position. That naive `0..=pos` loop made lookbehind
-    // O(N^2) and hung on large buffers; it is now windowed to the inner pattern's
-    // maximum length, so a non-matching scan over a 200K-char haystack finishes
-    // near-instantly.
     let haystack = "abcdefghij".repeat(20_000); // 200K chars, contains no 'z'
     let re = Regex::new(r"(?<!x)zzzzznomatch", Flags::default()).unwrap();
     let start = std::time::Instant::now();
@@ -494,9 +497,6 @@ fn test_lookbehind_large_input_is_linear() {
 
 #[test]
 fn test_prefilter_sees_through_assertions() {
-    // The start prefilter keys on the first *consumed* literal even when the
-    // pattern opens with zero-width assertions. It must never cause a false
-    // negative (skip a position that actually matches).
     assert_find(r"^bar", "bar", "bar");
     assert_find(r"\bbar", "foo bar", "bar");
     assert_find(r"(?<!z)bar", "  bar", "bar");
@@ -521,9 +521,6 @@ fn test_lookbehind_non_ascii_no_panic() {
 
 #[test]
 fn test_unicode_class_no_panic_and_matches() {
-    // Regression: Unicode-aware classes (`\w`, `\s`, ...) must not use an ASCII
-    // byte start-filter. Doing so indexed out of bounds on UTF-8 continuation
-    // bytes (panic) and skipped non-ASCII matches.
     let hay = "héllo wörld café";
 
     let re = Regex::new_linear(r"\w+", Flags::default()).unwrap();
@@ -577,11 +574,51 @@ fn test_replace_groups() {
     assert_eq!(re.replace_all("hello world", "word"), "word word");
 }
 
+#[test]
+fn test_replace_with_capture_references() {
+    let re = Regex::new(r"(\w+)@(\w+)\.(\w+)", Flags::default()).unwrap();
+    assert_eq!(
+        re.replace("contact user@example.com today", "$1 at $2 dot $3"),
+        "contact user at example dot com today"
+    );
+    assert_eq!(
+        re.replace_all("user@example.com and admin@test.org", "[$1]"),
+        "[user] and [admin]"
+    );
+}
+
+#[test]
+fn test_group_backtracks_across_boundary() {
+    assert_find("(a+)(a+)", "aaaa", "aaaa");
+    assert_find("(a|ab)c", "abc", "abc");
+    assert_find("(a|ab)(c|bcd)", "abcd", "abcd");
+    assert_no_match("(a|ab)c", "ab");
+}
+
+#[test]
+fn test_group_backtracks_min_required_repetitions() {
+    assert_find("(?:aa|a){2}a", "aaa", "aaa");
+    assert_no_match("(?:aa|a){2}a", "aa");
+}
+
+#[test]
+fn test_group_backtrack_captures_correct_split() {
+    let re = Regex::new("(a+)(a+)", Flags::default()).unwrap();
+    let caps = re.captures("aaaa").unwrap();
+    // Greedy: the first group takes as much as it can while still leaving
+    // the second group (which requires at least one 'a') something to match.
+    assert_eq!(caps.as_str("aaaa", 1), Some("aaa"));
+    assert_eq!(caps.as_str("aaaa", 2), Some("a"));
+}
+
+#[test]
+fn test_replace_literal_dollar_sign() {
+    let re = Regex::new(r"(\d+)", Flags::default()).unwrap();
+    assert_eq!(re.replace("price: 42", "$$$1"), "price: $42");
+}
+
 // --- 9. Complex Scenarios ---
 
-// Email test failing due to parser issues with complex classes
-// #[test]
-// fn test_email_ish() { ... }
 
 #[test]
 fn test_ipv4() {
@@ -603,4 +640,103 @@ fn test_unicode_flag() {
     // So we check that it DOES match, rather than DOES NOT match.
     let _re_ascii = Regex::new(r"\w+", Flags::default()).unwrap();
     assert!(_re_ascii.is_match("über"));
+}
+
+// --- Production-hardening: catastrophic backtracking & deep nesting ---
+
+#[test]
+fn test_catastrophic_backtracking_bounded_by_step_budget() {
+    let re = Regex::new(r"(a+)+b", Flags::default()).unwrap();
+    let haystack = "a".repeat(40);
+
+    let start = std::time::Instant::now();
+    let result = re.is_match(&haystack);
+    let elapsed = start.elapsed();
+
+    assert!(!result, "no trailing 'b', so this must not match");
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "catastrophic pattern took {:?} - step budget did not bound it",
+        elapsed
+    );
+}
+
+#[test]
+fn test_catastrophic_backtracking_alternation_bounded() {
+    // (a|a)*b - overlapping-alternation shape, same exponential-blowup risk
+    // as (a+)+b but via repeated alternation instead of nested quantifiers.
+    let re = Regex::new(r"(a|a)*b", Flags::default()).unwrap();
+    let haystack = "a".repeat(30);
+
+    let start = std::time::Instant::now();
+    let result = re.is_match(&haystack);
+    let elapsed = start.elapsed();
+
+    assert!(!result);
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "catastrophic pattern took {:?} - step budget did not bound it",
+        elapsed
+    );
+}
+
+#[test]
+fn test_step_budget_does_not_affect_ordinary_matches() {
+    assert_match(r"(a+)+b", "aaaaaaaaaab");
+    assert_match(r"(foo|bar|baz)+qux", "foobarbazqux");
+    assert_match(r"(\w+\s)+end", "one two three end");
+    assert_no_match(r"(a+)+b", "aaaaaaaaaa");
+}
+
+#[test]
+fn test_deeply_nested_groups_rejected_cleanly() {
+    let depth = 10_000;
+    let pattern = format!("{}a{}", "(".repeat(depth), ")".repeat(depth));
+
+    let result = Regex::new(&pattern, Flags::default());
+    assert!(
+        result.is_err(),
+        "pattern nested {} groups deep should be rejected, not accepted",
+        depth
+    );
+
+    // Same check against the linear engine's own (separate) parse call.
+    let result_linear = Regex::new_linear(&pattern, Flags::default());
+    assert!(result_linear.is_err());
+}
+
+#[test]
+fn test_moderately_nested_groups_still_work() {
+    // Sanity check that the new depth guard doesn't false-trip on nesting
+    // depths a real pattern might plausibly use.
+    let depth = 50;
+    let pattern = format!("{}a{}", "(".repeat(depth), ")".repeat(depth));
+    assert_match(&pattern, "a");
+}
+
+#[test]
+fn test_lookbehind_with_greedy_unbounded_body_backtracks_to_boundary() {
+    assert_match(r"(?<=.*)a", "a");
+    assert_find(r"(?<=.*)a", "ba", "a");
+
+    let re = Regex::new(r".??(?<!.*[1c ]*)", Flags::default()).unwrap();
+    assert_eq!(re.find_all("b1c1 1c0").count(), 0);
+}
+
+#[test]
+fn test_nested_lazy_quantifier_does_not_overmatch() {
+    assert_match(r"(?:c??){1,2}", "");
+    assert_find(r"(?:c??){1,2}", "aa", "");
+
+    // Same shape, wrapped in an alternation whose first branch is the
+    // empty-preferring one.
+    assert_find(r"^(?:[c]??|0{1,2}c){1,3}", "", "");
+
+    // Same shape again, but where the nested empty-preferring construct sits
+    // inside a multi-node group rather than being the sole element.
+    assert_find(r"( *?0{0,2}c??)?", " ", "");
+
+    assert_find(r"(\S{2}c{3}.{1,2}| *?0{0,2}c??)?", " ", "");
+
+    assert_find(r"(c??)?d", "cd", "cd");
 }

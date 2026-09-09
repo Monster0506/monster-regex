@@ -16,10 +16,28 @@
 ///   7. log_line      – \[\d{4}-\d{2}-\d{2}\] \w+: .*  (mixed shape, unbounded `.*` tail)
 ///   8. word_boundary – \bfoo\b
 ///   9. unicode_word  – \w+ over non-ASCII (accented Latin) text
+///   10. sparse_literal – "needle" appearing once near the end of a large document
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use monster_regex::{Flags, Regex};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/// Builds a `regex` crate `Regex` with the same case-sensitivity
+/// monster-regex's smartcase would pick for this pattern (case-insensitive
+/// whenever the pattern has no uppercase letter at all - true of most of the
+/// patterns below, since `\d`, `\w`, `foo`, etc. are all lowercase). `regex`
+/// has no smartcase of its own and is case-sensitive by default, so without
+/// this every benchmark using such a pattern would silently compare
+/// monster-regex's case-insensitive match against `regex`'s case-sensitive
+/// one - a real cost difference, not a fair reading of either engine's
+/// per-byte speed.
+fn regex_crate_matching_case(pattern: &str) -> regex::Regex {
+    let case_insensitive = !pattern.chars().any(|c| c.is_uppercase());
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .unwrap()
+}
 
 fn make_rust_code(target_bytes: usize) -> String {
     let chunk = "fn function_x() -> Result<(), Error> {\n    let x = 42;\n    if x > 10 {\n        return Ok(());\n    }\n    return Err(Error::new());\n}\n\n";
@@ -117,7 +135,7 @@ fn bench_literal(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("regex_crate", label), &input, |b, text| {
-            let re = regex::Regex::new("fn").unwrap();
+            let re = regex_crate_matching_case("fn");
             b.iter(|| re.find_iter(black_box(text)).count())
         });
     }
@@ -140,7 +158,7 @@ fn bench_date(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("regex_crate", label), &input, |b, text| {
-            let re = regex::Regex::new(r"\d{4}-\d{2}-\d{2}").unwrap();
+            let re = regex_crate_matching_case(r"\d{4}-\d{2}-\d{2}");
             b.iter(|| re.find_iter(black_box(text)).count())
         });
     }
@@ -163,7 +181,7 @@ fn bench_email(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("regex_crate", label), &input, |b, text| {
-            let re = regex::Regex::new(r"\w+@\w+\.\w+").unwrap();
+            let re = regex_crate_matching_case(r"\w+@\w+\.\w+");
             b.iter(|| re.find_iter(black_box(text)).count())
         });
     }
@@ -186,7 +204,7 @@ fn bench_dna(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("regex_crate", label), &input, |b, text| {
-            let re = regex::Regex::new(r"[AC]+G+[TA]+").unwrap();
+            let re = regex_crate_matching_case(r"[AC]+G+[TA]+");
             b.iter(|| re.find_iter(black_box(text)).count())
         });
     }
@@ -204,13 +222,13 @@ fn bench_ipv4(c: &mut Criterion) {
         let label = size_label(sz);
 
         group.bench_with_input(BenchmarkId::new("monster", label), &input, |b, text| {
-            let re = Regex::new_linear(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", Flags::default())
-                .unwrap();
+            let re =
+                Regex::new_linear(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", Flags::default()).unwrap();
             b.iter(|| re.find_all(black_box(text)).count())
         });
 
         group.bench_with_input(BenchmarkId::new("regex_crate", label), &input, |b, text| {
-            let re = regex::Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}").unwrap();
+            let re = regex_crate_matching_case(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}");
             b.iter(|| re.find_iter(black_box(text)).count())
         });
     }
@@ -235,7 +253,7 @@ fn bench_http_method(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("regex_crate", label), &input, |b, text| {
-            let re = regex::Regex::new(r"GET|POST|PUT|DELETE").unwrap();
+            let re = regex_crate_matching_case(r"GET|POST|PUT|DELETE");
             b.iter(|| re.find_iter(black_box(text)).count())
         });
     }
@@ -256,13 +274,12 @@ fn bench_log_line(c: &mut Criterion) {
         let label = size_label(sz);
 
         group.bench_with_input(BenchmarkId::new("monster", label), &input, |b, text| {
-            let re = Regex::new_linear(r"\[\d{4}-\d{2}-\d{2}\] \w+: .*", Flags::default())
-                .unwrap();
+            let re = Regex::new_linear(r"\[\d{4}-\d{2}-\d{2}\] \w+: .*", Flags::default()).unwrap();
             b.iter(|| re.find_all(black_box(text)).count())
         });
 
         group.bench_with_input(BenchmarkId::new("regex_crate", label), &input, |b, text| {
-            let re = regex::Regex::new(r"\[\d{4}-\d{2}-\d{2}\] \w+: .*").unwrap();
+            let re = regex_crate_matching_case(r"\[\d{4}-\d{2}-\d{2}\] \w+: .*");
             b.iter(|| re.find_iter(black_box(text)).count())
         });
     }
@@ -286,7 +303,7 @@ fn bench_word_boundary(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("regex_crate", label), &input, |b, text| {
-            let re = regex::Regex::new(r"\bfoo\b").unwrap();
+            let re = regex_crate_matching_case(r"\bfoo\b");
             b.iter(|| re.find_iter(black_box(text)).count())
         });
     }
@@ -312,7 +329,44 @@ fn bench_unicode_word(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("regex_crate", label), &input, |b, text| {
-            let re = regex::Regex::new(r"\w+").unwrap();
+            let re = regex_crate_matching_case(r"\w+");
+            b.iter(|| re.find_iter(black_box(text)).count())
+        });
+    }
+    group.finish();
+}
+
+// 10. Sparse literal search: a specific, rare term appearing once near the
+// end of an otherwise non-matching document - "find where I used this
+// identifier" rather than "find this common keyword everywhere," which
+// `literal_fn` above already covers. Dense keyword search interrupts a
+// SIMD scan on almost every chunk (little chance for wider registers to pay
+// off); a rare term instead spends nearly the whole scan on chunks with no
+// candidate at all, which is exactly where a wider SIMD kernel should win.
+fn make_sparse_needle_text(target_bytes: usize) -> String {
+    let filler = "the quick brown fox jumps over the lazy dog and runs away ";
+    let reps = (target_bytes / filler.len()).max(1);
+    let mut s = filler.repeat(reps);
+    s.push_str("needle");
+    s
+}
+
+fn bench_sparse_literal(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sparse_literal");
+    group.sample_size(20);
+
+    for &sz in SIZES {
+        let input = make_sparse_needle_text(sz);
+        group.throughput(Throughput::Bytes(input.len() as u64));
+        let label = size_label(sz);
+
+        group.bench_with_input(BenchmarkId::new("monster", label), &input, |b, text| {
+            let re = Regex::new_linear("needle", Flags::default()).unwrap();
+            b.iter(|| re.find_all(black_box(text)).count())
+        });
+
+        group.bench_with_input(BenchmarkId::new("regex_crate", label), &input, |b, text| {
+            let re = regex_crate_matching_case("needle");
             b.iter(|| re.find_iter(black_box(text)).count())
         });
     }
@@ -329,6 +383,7 @@ criterion_group!(
     bench_http_method,
     bench_log_line,
     bench_word_boundary,
-    bench_unicode_word
+    bench_unicode_word,
+    bench_sparse_literal
 );
 criterion_main!(benches);

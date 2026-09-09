@@ -1,10 +1,6 @@
 /// Configuration flags that modify the behavior of the regular expression engine.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Flags {
-    /// Controls case sensitivity.
-    /// - `None`: Smartcase (case-insensitive if pattern is all lowercase, sensitive otherwise).
-    /// - `Some(true)`: Case-insensitive (`i` flag).
-    /// - `Some(false)`: Case-sensitive (`c` flag).
     pub ignore_case: Option<bool>,
     /// If true, `^` and `$` match line boundaries (`\n`) instead of just the start/end of the text (`m` flag).
     pub multiline: bool,
@@ -17,4 +13,5 @@ pub struct Flags {
     /// If true, indicates that the regex should match all occurrences (`g` flag).
     /// Note: This flag is often handled by the caller (e.g., `find_all` vs `find`), but is preserved here for parsing.
     pub global: bool,
+    pub max_backtrack_steps: Option<u64>,
 }

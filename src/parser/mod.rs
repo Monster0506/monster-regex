@@ -167,6 +167,8 @@ pub struct CharRange {
     pub end: char,
 }
 
+const MAX_GROUP_DEPTH: usize = 200;
+
 /// The recursive descent parser for the regex pattern.
 #[derive(Debug, Clone)]
 pub struct Parser {
@@ -174,6 +176,7 @@ pub struct Parser {
     pos: usize,
     flags: Flags,
     group_count: usize,
+    depth: usize,
 }
 
 /// Errors that can occur during parsing.
@@ -190,6 +193,8 @@ pub enum ParseError {
     InvalidBackref(usize),
     InvalidLineNumber(String),
     InvalidGroup(String),
+    /// A pattern nested groups/lookarounds more than `MAX_GROUP_DEPTH` deep.
+    NestingTooDeep(usize),
 }
 
 impl fmt::Display for ParseError {
@@ -224,6 +229,9 @@ impl fmt::Display for ParseError {
             ParseError::InvalidGroup(s) => {
                 write!(f, "Invalid group syntax: {}", s)
             }
+            ParseError::NestingTooDeep(max) => {
+                write!(f, "Pattern nests groups more than {} levels deep", max)
+            }
         }
     }
 }
@@ -238,6 +246,7 @@ impl Parser {
             pos: 0,
             flags,
             group_count: 0,
+            depth: 0,
         }
     }
 
@@ -482,22 +491,31 @@ impl Parser {
     fn parse_group(&mut self) -> Result<AstNode, ParseError> {
         self.consume()?; // consume (
 
-        if self.current() == Some(&'?') {
+        self.depth += 1;
+        if self.depth > MAX_GROUP_DEPTH {
+            return Err(ParseError::NestingTooDeep(MAX_GROUP_DEPTH));
+        }
+
+        let result = if self.current() == Some(&'?') {
             self.consume()?;
             self.parse_extended_group()
         } else {
             // Capturing group
             self.group_count += 1;
             let index = self.group_count;
-            let nodes = self.parse_alternation()?;
-            self.expect_close_paren()?;
-            Ok(AstNode::Group {
-                nodes,
-                name: None,
-                capture: true,
-                index: Some(index),
+            self.parse_alternation().and_then(|nodes| {
+                self.expect_close_paren()?;
+                Ok(AstNode::Group {
+                    nodes,
+                    name: None,
+                    capture: true,
+                    index: Some(index),
+                })
             })
-        }
+        };
+
+        self.depth -= 1;
+        result
     }
 
     fn parse_extended_group(&mut self) -> Result<AstNode, ParseError> {
@@ -670,17 +688,17 @@ impl Parser {
     // Apply quantifiers: *, +, ?, {n}, {n,m}, etc
     fn apply_quantifier(&mut self, node: AstNode) -> Result<AstNode, ParseError> {
         self.skip_whitespace_and_comments();
-        match self.current() {
+        let quantified = match self.current() {
             Some(&'*') => {
                 self.consume()?;
                 let greedy = self.current() != Some(&'?');
                 if !greedy {
                     self.consume()?;
                 }
-                Ok(AstNode::ZeroOrMore {
+                AstNode::ZeroOrMore {
                     node: Box::new(node),
                     greedy,
-                })
+                }
             }
             Some(&'+') => {
                 self.consume()?;
@@ -688,10 +706,10 @@ impl Parser {
                 if !greedy {
                     self.consume()?;
                 }
-                Ok(AstNode::OneOrMore {
+                AstNode::OneOrMore {
                     node: Box::new(node),
                     greedy,
-                })
+                }
             }
             Some(&'?') => {
                 self.consume()?;
@@ -699,14 +717,15 @@ impl Parser {
                 if !greedy {
                     self.consume()?;
                 }
-                Ok(AstNode::Optional {
+                AstNode::Optional {
                     node: Box::new(node),
                     greedy,
-                })
+                }
             }
-            Some(&'{') => self.parse_bounded_quantifier(node),
-            _ => Ok(node),
-        }
+            Some(&'{') => self.parse_bounded_quantifier(node)?,
+            _ => return Ok(node),
+        };
+        self.apply_quantifier(quantified)
     }
 
     // Parse {n}, {n,}, {n,m}, {,m}
@@ -749,6 +768,9 @@ impl Parser {
             }
             Some(&'}') => {
                 self.consume()?;
+                if self.current() == Some(&'?') {
+                    self.consume()?;
+                }
                 Ok(AstNode::Exact {
                     node: Box::new(node),
                     count: min,

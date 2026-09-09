@@ -3,6 +3,12 @@ use crate::flags::Flags;
 use crate::parser::{AstNode, CharClass};
 
 use crate::haystack::{Haystack, HaystackCursor};
+use std::cell::Cell;
+
+const DEFAULT_MAX_BACKTRACK_STEPS: u64 = 2_000_000;
+
+type MatchCont<'c, C> =
+    dyn FnMut(usize, &mut MatchContext, &mut C, Option<char>) -> Option<usize> + 'c;
 
 /// The matching engine that walks the AST to find matches in text.
 pub struct Matcher<'a, H: Haystack> {
@@ -10,6 +16,8 @@ pub struct Matcher<'a, H: Haystack> {
     flags: &'a Flags,
     text: H,
     prefilter: &'a Prefilter,
+    steps: Cell<u64>,
+    max_steps: u64,
 }
 
 struct QuantifierParams {
@@ -49,7 +57,18 @@ impl<'a, H: Haystack> Matcher<'a, H> {
             flags,
             text,
             prefilter,
+            steps: Cell::new(0),
+            max_steps: flags
+                .max_backtrack_steps
+                .unwrap_or(DEFAULT_MAX_BACKTRACK_STEPS),
         }
+    }
+
+    #[inline]
+    fn tick(&self) -> bool {
+        let n = self.steps.get() + 1;
+        self.steps.set(n);
+        n <= self.max_steps
     }
 
     /// Finds the first match in the text.
@@ -59,6 +78,10 @@ impl<'a, H: Haystack> Matcher<'a, H> {
 
     /// Finds the first match in the text starting at the given position.
     pub fn find_at(&self, start_index: usize) -> Option<Match> {
+        self.find_at_captures(start_index).map(|(m, _)| m)
+    }
+
+    pub fn find_at_captures(&self, start_index: usize) -> Option<(Match, Vec<Option<Match>>)> {
         // Determine max group index for context sizing
         let max_group = self.count_groups(self.nodes);
         let len = self.text.len();
@@ -87,14 +110,20 @@ impl<'a, H: Haystack> Matcher<'a, H> {
             };
 
             context.clear();
+            self.steps.set(0);
             let mut match_cursor = cursor.clone();
 
-            if let Some(end_pos) =
-                self.match_nodes(self.nodes, pos, &mut context, &mut match_cursor, prev_char)
-            {
+            if let Some(end_pos) = self.match_nodes(
+                self.nodes,
+                pos,
+                &mut context,
+                &mut match_cursor,
+                prev_char,
+                &mut |p, _, _, _| Some(p),
+            ) {
                 let start = context.match_start_override.unwrap_or(pos);
                 let end = context.match_end_override.unwrap_or(end_pos);
-                return Some(Match { start, end });
+                return Some((Match { start, end }, context.captures));
             }
 
             // No match at `pos`; advance one character and try again.
@@ -148,9 +177,14 @@ impl<'a, H: Haystack> Matcher<'a, H> {
         ctx: &mut MatchContext,
         cursor: &mut H::Cursor,
         prev_char: Option<char>,
+        cont: &mut MatchCont<'_, H::Cursor>,
     ) -> Option<usize> {
+        if !self.tick() {
+            return None;
+        }
+
         if nodes.is_empty() {
-            return Some(pos);
+            return cont(pos, ctx, cursor, prev_char);
         }
 
         let node = &nodes[0];
@@ -171,7 +205,7 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 if matches {
                     let next_pos = pos + char_len;
                     *cursor = temp_cursor;
-                    self.match_nodes(remaining, next_pos, ctx, cursor, Some(current_char))
+                    self.match_nodes(remaining, next_pos, ctx, cursor, Some(current_char), cont)
                 } else {
                     None
                 }
@@ -182,7 +216,7 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 let len = current_char.len_utf8();
                 if self.match_char_class(class, current_char) {
                     *cursor = temp_cursor;
-                    self.match_nodes(remaining, pos + len, ctx, cursor, Some(current_char))
+                    self.match_nodes(remaining, pos + len, ctx, cursor, Some(current_char), cont)
                 } else {
                     None
                 }
@@ -191,7 +225,7 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 let is_start = pos == 0;
                 let is_line_start = self.flags.multiline && pos > 0 && prev_char == Some('\n');
                 if is_start || is_line_start {
-                    self.match_nodes(remaining, pos, ctx, cursor, prev_char)
+                    self.match_nodes(remaining, pos, ctx, cursor, prev_char, cont)
                 } else {
                     None
                 }
@@ -201,65 +235,66 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 let is_line_end =
                     self.flags.multiline && pos < self.text.len() && cursor.peek() == Some('\n');
                 if is_end || is_line_end {
-                    self.match_nodes(remaining, pos, ctx, cursor, prev_char)
+                    self.match_nodes(remaining, pos, ctx, cursor, prev_char, cont)
                 } else {
                     None
                 }
             }
             AstNode::WordBoundary => {
                 if self.is_word_boundary(cursor, prev_char) {
-                    self.match_nodes(remaining, pos, ctx, cursor, prev_char)
+                    self.match_nodes(remaining, pos, ctx, cursor, prev_char, cont)
                 } else {
                     None
                 }
             }
             AstNode::StartWord => {
                 if self.is_word_boundary(cursor, prev_char) && self.is_word_char_at(cursor) {
-                    self.match_nodes(remaining, pos, ctx, cursor, prev_char)
+                    self.match_nodes(remaining, pos, ctx, cursor, prev_char, cont)
                 } else {
                     None
                 }
             }
             AstNode::EndWord => {
                 if self.is_word_boundary(cursor, prev_char) && !self.is_word_char_at(cursor) {
-                    self.match_nodes(remaining, pos, ctx, cursor, prev_char)
+                    self.match_nodes(remaining, pos, ctx, cursor, prev_char, cont)
                 } else {
                     None
                 }
             }
             AstNode::SetMatchStart => {
+                let prev = ctx.match_start_override;
                 ctx.match_start_override = Some(pos);
-                self.match_nodes(remaining, pos, ctx, cursor, prev_char)
+                let result = self.match_nodes(remaining, pos, ctx, cursor, prev_char, cont);
+                if result.is_none() {
+                    ctx.match_start_override = prev;
+                }
+                result
             }
             AstNode::SetMatchEnd => {
+                let prev = ctx.match_end_override;
                 ctx.match_end_override = Some(pos);
-                self.match_nodes(remaining, pos, ctx, cursor, prev_char)
+                let result = self.match_nodes(remaining, pos, ctx, cursor, prev_char, cont);
+                if result.is_none() {
+                    ctx.match_end_override = prev;
+                }
+                result
             }
             AstNode::Alternation(alts) => {
                 for alt in alts {
-                    let mut fork_ctx = ctx.clone();
                     let mut fork_cursor = cursor.clone();
-
-                    if let Some(next_pos) =
-                        self.match_nodes(alt, pos, &mut fork_ctx, &mut fork_cursor, prev_char)
-                    {
-                        let next_prev_char = if next_pos > pos {
-                            self.text.char_before(next_pos)
-                        } else {
-                            prev_char
-                        };
-
-                        if let Some(final_pos) = self.match_nodes(
-                            remaining,
-                            next_pos,
-                            &mut fork_ctx,
-                            &mut fork_cursor,
-                            next_prev_char,
-                        ) {
-                            *ctx = fork_ctx;
-                            *cursor = fork_cursor;
-                            return Some(final_pos);
-                        }
+                    let cont = &mut *cont;
+                    if let Some(final_pos) = self.match_nodes(
+                        alt,
+                        pos,
+                        ctx,
+                        &mut fork_cursor,
+                        prev_char,
+                        &mut |next_pos, ctx, cursor, next_prev_char| {
+                            self.match_nodes(remaining, next_pos, ctx, cursor, next_prev_char, cont)
+                        },
+                    ) {
+                        *cursor = fork_cursor;
+                        return Some(final_pos);
                     }
                 }
                 None
@@ -271,48 +306,49 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 ..
             } => {
                 let start_capture = pos;
-                let mut group_cursor = cursor.clone();
-
-                if let Some(next_pos) =
-                    self.match_nodes(group_nodes, pos, ctx, &mut group_cursor, prev_char)
-                {
-                    if *capture && index.is_some() {
-                        let idx = index.unwrap();
-                        if idx < ctx.captures.len() {
+                let capture = *capture;
+                let index = *index;
+                self.match_nodes(
+                    group_nodes,
+                    pos,
+                    ctx,
+                    cursor,
+                    prev_char,
+                    &mut |next_pos, ctx, cursor, next_prev_char| {
+                        let saved = if capture
+                            && let Some(idx) = index
+                            && idx < ctx.captures.len()
+                        {
+                            let prev = ctx.captures[idx].clone();
                             ctx.captures[idx] = Some(Match {
                                 start: start_capture,
                                 end: next_pos,
                             });
+                            Some((idx, prev))
+                        } else {
+                            None
+                        };
+                        let result = self.match_nodes(
+                            remaining,
+                            next_pos,
+                            ctx,
+                            cursor,
+                            next_prev_char,
+                            cont,
+                        );
+                        if result.is_none()
+                            && let Some((idx, prev)) = saved
+                        {
+                            ctx.captures[idx] = prev;
                         }
-                    }
-
-                    let next_prev_char = if next_pos > pos {
-                        self.text.char_before(next_pos)
-                    } else {
-                        prev_char
-                    };
-
-                    if let Some(end_pos) = self.match_nodes(
-                        remaining,
-                        next_pos,
-                        ctx,
-                        &mut group_cursor,
-                        next_prev_char,
-                    ) {
-                        *cursor = group_cursor;
-                        Some(end_pos)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+                        result
+                    },
+                )
             }
             AstNode::Backref(idx) => {
                 if let Some(Some(m)) = ctx.captures.get(*idx) {
                     if self.text.matches_range(pos, m.start, m.end) {
                         let len_to_skip = m.end - m.start;
-                        // let mut temp_pos = pos; // Removed unused variable
                         let mut temp_cursor = cursor.clone();
 
                         let target_pos = pos + len_to_skip;
@@ -329,7 +365,7 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                         }
 
                         *cursor = temp_cursor;
-                        self.match_nodes(remaining, target_pos, ctx, cursor, last_char)
+                        self.match_nodes(remaining, target_pos, ctx, cursor, last_char, cont)
                     } else {
                         None
                     }
@@ -344,10 +380,20 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 let mut look_ctx = ctx.clone();
                 let mut look_cursor = cursor.clone();
                 let matched = self
-                    .match_nodes(look_nodes, pos, &mut look_ctx, &mut look_cursor, prev_char)
+                    .match_nodes(
+                        look_nodes,
+                        pos,
+                        &mut look_ctx,
+                        &mut look_cursor,
+                        prev_char,
+                        &mut |p, _, _, _| Some(p),
+                    )
                     .is_some();
                 if matched == *positive {
-                    self.match_nodes(remaining, pos, ctx, cursor, prev_char)
+                    if *positive {
+                        ctx.captures = look_ctx.captures;
+                    }
+                    self.match_nodes(remaining, pos, ctx, cursor, prev_char, cont)
                 } else {
                     None
                 }
@@ -360,6 +406,7 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 // (boundary-safe) up to the lookbehind's max byte length.
                 let max_len = max_consumable_bytes(look_nodes);
                 let mut matched = false;
+                let mut matched_captures = None;
                 let mut start = pos;
                 loop {
                     let mut look_ctx = ctx.clone();
@@ -370,15 +417,19 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                         None
                     };
 
-                    if let Some(end) = self.match_nodes(
-                        look_nodes,
-                        start,
-                        &mut look_ctx,
-                        &mut look_cursor,
-                        start_prev_char,
-                    ) && end == pos
+                    if self
+                        .match_nodes(
+                            look_nodes,
+                            start,
+                            &mut look_ctx,
+                            &mut look_cursor,
+                            start_prev_char,
+                            &mut |p, _, _, _| if p == pos { Some(p) } else { None },
+                        )
+                        .is_some()
                     {
                         matched = true;
+                        matched_captures = Some(look_ctx.captures);
                         break;
                     }
 
@@ -398,7 +449,12 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 }
 
                 if matched == *positive {
-                    self.match_nodes(remaining, pos, ctx, cursor, prev_char)
+                    // Same reasoning as `LookAhead`: a successful *positive*
+                    // lookbehind's captures stay visible afterward.
+                    if *positive && let Some(captures) = matched_captures {
+                        ctx.captures = captures;
+                    }
+                    self.match_nodes(remaining, pos, ctx, cursor, prev_char, cont)
                 } else {
                     None
                 }
@@ -415,9 +471,11 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 },
                 remaining,
                 pos,
+                pos,
                 ctx,
                 cursor,
                 prev_char,
+                cont,
             ),
             AstNode::OneOrMore {
                 node: inner,
@@ -431,9 +489,11 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 },
                 remaining,
                 pos,
+                pos,
                 ctx,
                 cursor,
                 prev_char,
+                cont,
             ),
             AstNode::Optional {
                 node: inner,
@@ -447,9 +507,11 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 },
                 remaining,
                 pos,
+                pos,
                 ctx,
                 cursor,
                 prev_char,
+                cont,
             ),
             AstNode::Exact { node: inner, count } => self.match_quantifier(
                 inner,
@@ -460,9 +522,11 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 },
                 remaining,
                 pos,
+                pos,
                 ctx,
                 cursor,
                 prev_char,
+                cont,
             ),
             AstNode::Range {
                 node: inner,
@@ -478,9 +542,11 @@ impl<'a, H: Haystack> Matcher<'a, H> {
                 },
                 remaining,
                 pos,
+                pos,
                 ctx,
                 cursor,
                 prev_char,
+                cont,
             ),
         }
     }
@@ -492,36 +558,101 @@ impl<'a, H: Haystack> Matcher<'a, H> {
         params: QuantifierParams,
         remaining: &[AstNode],
         pos: usize,
+        origin: usize,
         ctx: &mut MatchContext,
         cursor: &mut H::Cursor,
-        mut prev_char: Option<char>,
+        prev_char: Option<char>,
+        cont: &mut MatchCont<'_, H::Cursor>,
     ) -> Option<usize> {
-        // 1. Match minimum required times
-        let mut curr_pos = pos;
-        for _ in 0..params.min {
-            if let Some(next_pos) =
-                self.match_nodes(std::slice::from_ref(node), curr_pos, ctx, cursor, prev_char)
-            {
-                // Update prev_char for next iteration
-                if next_pos > curr_pos {
-                    prev_char = self.text.char_before(next_pos);
-                }
-                curr_pos = next_pos;
-            } else {
-                return None;
-            }
+        if !self.tick() {
+            return None;
         }
 
-        // 2. Match optional times
+        if params.min > 0 {
+            if !node_has_choice_point(node) {
+                let ctx_snapshot = node_mutates_ctx(node).then(|| ctx.clone());
+                let mut curr_pos = pos;
+                let mut curr_prev = prev_char;
+                for _ in 0..params.min {
+                    match self.match_nodes(
+                        std::slice::from_ref(node),
+                        curr_pos,
+                        ctx,
+                        cursor,
+                        curr_prev,
+                        &mut |p, _, _, _| Some(p),
+                    ) {
+                        Some(next_pos) => {
+                            if next_pos > curr_pos {
+                                curr_prev = self.text.char_before(next_pos);
+                            }
+                            curr_pos = next_pos;
+                        }
+                        None => {
+                            if let Some(snapshot) = ctx_snapshot {
+                                *ctx = snapshot;
+                            }
+                            return None;
+                        }
+                    }
+                }
+                let result = self.match_quantifier_optional(
+                    node,
+                    params.max.map(|m| m - params.min),
+                    params.greedy,
+                    remaining,
+                    curr_pos,
+                    origin,
+                    ctx,
+                    cursor,
+                    curr_prev,
+                    cont,
+                );
+                if result.is_none()
+                    && let Some(snapshot) = ctx_snapshot
+                {
+                    *ctx = snapshot;
+                }
+                return result;
+            }
+
+            return self.match_nodes(
+                std::slice::from_ref(node),
+                pos,
+                ctx,
+                cursor,
+                prev_char,
+                &mut |next_pos, ctx, cursor, next_prev_char| {
+                    self.match_quantifier(
+                        node,
+                        QuantifierParams {
+                            min: params.min - 1,
+                            max: params.max.map(|m| m.saturating_sub(1)),
+                            greedy: params.greedy,
+                        },
+                        remaining,
+                        next_pos,
+                        origin,
+                        ctx,
+                        cursor,
+                        next_prev_char,
+                        cont,
+                    )
+                },
+            );
+        }
+
         self.match_quantifier_optional(
             node,
-            params.max.map(|m| m - params.min),
+            params.max,
             params.greedy,
             remaining,
-            curr_pos,
+            pos,
+            origin,
             ctx,
             cursor,
             prev_char,
+            cont,
         )
     }
 
@@ -533,83 +664,143 @@ impl<'a, H: Haystack> Matcher<'a, H> {
         greedy: bool,
         remaining: &[AstNode],
         pos: usize,
+        origin: usize,
         ctx: &mut MatchContext,
         cursor: &mut H::Cursor,
         prev_char: Option<char>,
+        cont: &mut MatchCont<'_, H::Cursor>,
     ) -> Option<usize> {
-        if let Some(0) = max_remaining {
-            return self.match_nodes(remaining, pos, ctx, cursor, prev_char);
+        if !self.tick() {
+            return None;
         }
 
+        if let Some(0) = max_remaining {
+            return self.match_nodes(remaining, pos, ctx, cursor, prev_char, cont);
+        }
+
+        let force_wider = node_is_alternation(node) && pos != origin;
+
         if greedy {
-            // Try to match one more
-            let mut fork_ctx = ctx.clone();
             let mut fork_cursor = cursor.clone();
+            let took_more = {
+                let cont = &mut *cont;
+                self.match_nodes(
+                    std::slice::from_ref(node),
+                    pos,
+                    ctx,
+                    &mut fork_cursor,
+                    prev_char,
+                    &mut |next_pos, ctx, cursor, next_prev_char| {
+                        if next_pos == pos {
+                            if force_wider {
+                                return None;
+                            }
+                            return self.match_nodes(remaining, next_pos, ctx, cursor, next_prev_char, cont);
+                        }
+                        self.match_quantifier_optional(
+                            node,
+                            max_remaining.map(|m| m - 1),
+                            greedy,
+                            remaining,
+                            next_pos,
+                            origin,
+                            ctx,
+                            cursor,
+                            next_prev_char,
+                            cont,
+                        )
+                    },
+                )
+            };
+            if let Some(final_pos) = took_more {
+                *cursor = fork_cursor;
+                return Some(final_pos);
+            }
 
-            if let Some(next_pos) = self.match_nodes(
-                std::slice::from_ref(node),
-                pos,
-                &mut fork_ctx,
-                &mut fork_cursor,
-                prev_char,
-            ) {
-                let next_prev_char = if next_pos > pos {
-                    self.text.char_before(next_pos)
-                } else {
-                    prev_char
-                };
-
-                // Prevent infinite loops on zero-width matches
-                if next_pos > pos
-                    && let Some(final_pos) = self.match_quantifier_optional(
-                        node,
-                        max_remaining.map(|m| m - 1),
-                        greedy,
-                        remaining,
-                        next_pos,
-                        &mut fork_ctx,
+            if force_wider {
+                let mut fork_cursor = cursor.clone();
+                let took_empty = {
+                    let cont = &mut *cont;
+                    self.match_nodes(
+                        std::slice::from_ref(node),
+                        pos,
+                        ctx,
                         &mut fork_cursor,
-                        next_prev_char,
+                        prev_char,
+                        &mut |next_pos, ctx, cursor, next_prev_char| {
+                            self.match_nodes(remaining, next_pos, ctx, cursor, next_prev_char, cont)
+                        },
                     )
-                {
-                    *ctx = fork_ctx;
+                };
+                if let Some(final_pos) = took_empty {
                     *cursor = fork_cursor;
                     return Some(final_pos);
                 }
             }
 
-            // If we couldn't match more, or the recursive call failed, try matching the rest
-            self.match_nodes(remaining, pos, ctx, cursor, prev_char)
+            // Couldn't match one more, or everything after it failed - stop
+            // here and try `remaining` directly, with clean state.
+            self.match_nodes(remaining, pos, ctx, cursor, prev_char, cont)
         } else {
-            // Lazy: Try matching the rest first
-            let mut fork_ctx = ctx.clone();
             let mut fork_cursor = cursor.clone();
-            if let Some(final_pos) =
-                self.match_nodes(remaining, pos, &mut fork_ctx, &mut fork_cursor, prev_char)
-            {
-                *ctx = fork_ctx;
+            if let Some(final_pos) = {
+                let cont = &mut *cont;
+                self.match_nodes(remaining, pos, ctx, &mut fork_cursor, prev_char, cont)
+            } {
                 *cursor = fork_cursor;
                 return Some(final_pos);
             }
 
-            // If that fails, try matching one more
-            if let Some(next_pos) =
-                self.match_nodes(std::slice::from_ref(node), pos, ctx, cursor, prev_char)
-                && next_pos > pos
-            {
-                let next_prev_char = self.text.char_before(next_pos);
-                return self.match_quantifier_optional(
-                    node,
-                    max_remaining.map(|m| m - 1),
-                    greedy,
-                    remaining,
-                    next_pos,
+            let mut fork_cursor = cursor.clone();
+            let took_more = {
+                let cont = &mut *cont;
+                self.match_nodes(
+                    std::slice::from_ref(node),
+                    pos,
                     ctx,
-                    cursor,
-                    next_prev_char,
-                );
+                    &mut fork_cursor,
+                    prev_char,
+                    &mut |next_pos, ctx, cursor, next_prev_char| {
+                        if next_pos == pos {
+                            if force_wider {
+                                return None;
+                            }
+                            return self.match_nodes(remaining, next_pos, ctx, cursor, next_prev_char, cont);
+                        }
+                        self.match_quantifier_optional(
+                            node,
+                            max_remaining.map(|m| m - 1),
+                            greedy,
+                            remaining,
+                            next_pos,
+                            origin,
+                            ctx,
+                            cursor,
+                            next_prev_char,
+                            cont,
+                        )
+                    },
+                )
+            };
+            if let Some(final_pos) = took_more {
+                *cursor = fork_cursor;
+                return Some(final_pos);
             }
-            None
+
+            if !force_wider {
+                return None;
+            }
+
+            self.match_nodes(
+                std::slice::from_ref(node),
+                pos,
+                ctx,
+                cursor,
+                prev_char,
+                &mut |next_pos, ctx, cursor, next_prev_char| {
+                    self.match_nodes(remaining, next_pos, ctx, cursor, next_prev_char, cont)
+                },
+            )
         }
     }
 
@@ -722,6 +913,55 @@ pub struct BacktrackingRegex {
     flags: Flags,
     pattern: String,
     prefilter: Prefilter,
+    group_count: usize,
+    named_groups: std::collections::HashMap<String, usize>,
+}
+
+fn analyze_captures(nodes: &[AstNode]) -> (usize, std::collections::HashMap<String, usize>) {
+    fn visit(
+        nodes: &[AstNode],
+        count: &mut usize,
+        map: &mut std::collections::HashMap<String, usize>,
+    ) {
+        for node in nodes {
+            match node {
+                AstNode::Group {
+                    index,
+                    nodes,
+                    capture,
+                    name,
+                } => {
+                    if *capture && let Some(i) = index {
+                        *count = (*count).max(*i);
+                        if let Some(n) = name {
+                            map.insert(n.clone(), *i);
+                        }
+                    }
+                    visit(nodes, count, map);
+                }
+                AstNode::Alternation(alts) => {
+                    for alt in alts {
+                        visit(alt, count, map);
+                    }
+                }
+                AstNode::ZeroOrMore { node, .. }
+                | AstNode::OneOrMore { node, .. }
+                | AstNode::Optional { node, .. }
+                | AstNode::Exact { node, .. }
+                | AstNode::Range { node, .. } => {
+                    visit(std::slice::from_ref(node), count, map);
+                }
+                AstNode::LookAhead { nodes, .. } | AstNode::LookBehind { nodes, .. } => {
+                    visit(nodes, count, map);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut count = 0;
+    let mut map = std::collections::HashMap::new();
+    visit(nodes, &mut count, &mut map);
+    (count, map)
 }
 
 impl BacktrackingRegex {
@@ -739,13 +979,42 @@ impl BacktrackingRegex {
             .map_err(|e| CompileError::InvalidPattern(e.to_string()))?;
 
         let prefilter = analyze_prefilter(&ast, &flags);
+        let (group_count, named_groups) = analyze_captures(&ast);
 
         Ok(BacktrackingRegex {
             ast,
             flags,
             pattern: pattern.to_string(),
             prefilter,
+            group_count,
+            named_groups,
         })
+    }
+
+    fn build_captures(
+        &self,
+        full_match: Match,
+        raw: Vec<Option<Match>>,
+    ) -> crate::captures::Captures {
+        let groups: Vec<Option<Match>> = (1..=self.group_count)
+            .map(|i| raw.get(i).cloned().flatten())
+            .collect();
+        let named = self
+            .named_groups
+            .iter()
+            .filter_map(|(name, &idx)| {
+                groups
+                    .get(idx - 1)
+                    .cloned()
+                    .flatten()
+                    .map(|m| (name.clone(), m))
+            })
+            .collect();
+        crate::captures::Captures {
+            full_match,
+            groups,
+            named,
+        }
     }
 }
 
@@ -771,27 +1040,38 @@ impl CompiledRegex for BacktrackingRegex {
             text,
             regex: self,
             last_end: 0,
+            adjacent_empty: Default::default(),
         })
     }
 
-    fn captures(&self, _text: &str) -> Option<crate::captures::Captures> {
-        // TODO: Implement capture extraction in Matcher
-        None
+    fn captures(&self, text: &str) -> Option<crate::captures::Captures> {
+        let matcher = Matcher::new(&self.ast, &self.flags, text, &self.prefilter);
+        let (full_match, raw) = matcher.find_at_captures(0)?;
+        Some(self.build_captures(full_match, raw))
     }
 
     fn captures_all<'a>(
         &'a self,
-        _text: &'a str,
+        text: &'a str,
     ) -> Box<dyn Iterator<Item = crate::captures::Captures> + 'a> {
-        // TODO: Implement captures iterator
-        Box::new(std::iter::empty())
+        Box::new(CapturesIterator {
+            text,
+            regex: self,
+            last_end: 0,
+            adjacent_empty: Default::default(),
+        })
     }
 
     fn replace(&self, text: &str, replacement: &str) -> String {
-        if let Some(m) = self.find(text) {
+        if let Some(caps) = self.captures(text) {
+            let m = caps.full_match.clone();
             let mut result = String::with_capacity(text.len());
             result.push_str(&text[..m.start]);
-            result.push_str(replacement);
+            result.push_str(&crate::captures::expand_replacement(
+                &caps,
+                replacement,
+                text,
+            ));
             result.push_str(&text[m.end..]);
             result
         } else {
@@ -803,9 +1083,14 @@ impl CompiledRegex for BacktrackingRegex {
         let mut result = String::with_capacity(text.len() * 2);
         let mut last_end = 0;
 
-        for m in self.find_all(text) {
+        for caps in self.captures_all(text) {
+            let m = caps.full_match.clone();
             result.push_str(&text[last_end..m.start]);
-            result.push_str(replacement);
+            result.push_str(&crate::captures::expand_replacement(
+                &caps,
+                replacement,
+                text,
+            ));
             last_end = m.end;
         }
 
@@ -837,6 +1122,7 @@ impl crate::engine::CompiledRegexHaystack for BacktrackingRegex {
             text: haystack,
             regex: self,
             last_end: 0,
+            adjacent_empty: Default::default(),
         })
     }
 }
@@ -846,18 +1132,58 @@ struct FindMatchesIterator<'a, H: Haystack> {
     text: H,
     regex: &'a BacktrackingRegex,
     last_end: usize,
+    adjacent_empty: crate::captures::AdjacentEmptyFilter,
 }
 
 impl<'a, H: Haystack> Iterator for FindMatchesIterator<'a, H> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.last_end > self.text.len() {
-            return None;
+        loop {
+            if self.last_end > self.text.len() {
+                return None;
+            }
+            let m = self.regex.find_from_at(self.text, self.last_end)?;
+            self.last_end = m.end.max(m.start + 1);
+            if self.adjacent_empty.should_suppress(m.start, m.end) {
+                continue;
+            }
+            return Some(m);
         }
-        let m = self.regex.find_from_at(self.text, self.last_end)?;
-        self.last_end = m.end.max(m.start + 1);
-        Some(m)
+    }
+}
+
+struct CapturesIterator<'a> {
+    text: &'a str,
+    regex: &'a BacktrackingRegex,
+    last_end: usize,
+    adjacent_empty: crate::captures::AdjacentEmptyFilter,
+}
+
+impl<'a> Iterator for CapturesIterator<'a> {
+    type Item = crate::captures::Captures;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.last_end > self.text.len() {
+                return None;
+            }
+            let matcher = Matcher::new(
+                &self.regex.ast,
+                &self.regex.flags,
+                self.text,
+                &self.regex.prefilter,
+            );
+            let (full_match, raw) = matcher.find_at_captures(self.last_end)?;
+            self.last_end = full_match.end.max(full_match.start + 1);
+            if self
+                .adjacent_empty
+                .should_suppress(full_match.start, full_match.end)
+            {
+                continue;
+            }
+            return Some(self.regex.build_captures(full_match, raw));
+        }
     }
 }
 
@@ -1023,11 +1349,13 @@ fn analyze_prefilter(nodes: &[AstNode], flags: &Flags) -> Prefilter {
         };
     }
 
-    // Otherwise, derive a single first consuming byte (also peeking through a
-    // `+`/`{n}` wrapper around a literal, matching the original behavior).
     let first = match &nodes[0] {
         AstNode::Literal(c) => Some(*c),
-        AstNode::OneOrMore { node, .. } | AstNode::Exact { node, .. } => match &**node {
+        AstNode::OneOrMore { node, .. } => match &**node {
+            AstNode::Literal(c) => Some(*c),
+            _ => None,
+        },
+        AstNode::Exact { node, count } if *count > 0 => match &**node {
             AstNode::Literal(c) => Some(*c),
             _ => None,
         },
@@ -1053,11 +1381,44 @@ fn analyze_prefilter(nodes: &[AstNode], flags: &Flags) -> Prefilter {
     }
 }
 
-/// Upper bound, in bytes, on how much input a node sequence can consume.
-///
-/// Returns `None` when the sequence can match an unbounded amount of input
-/// (it contains `*`, `+`, an open-ended `{n,}`, or a backreference whose length
-/// is not known statically).
+fn node_has_choice_point(node: &AstNode) -> bool {
+    match node {
+        AstNode::Alternation(_) => true,
+        AstNode::Group { nodes, .. } => nodes.iter().any(node_has_choice_point),
+        AstNode::ZeroOrMore { .. } | AstNode::OneOrMore { .. } | AstNode::Optional { .. } => true,
+        AstNode::Exact { node, .. } => node_has_choice_point(node),
+        AstNode::Range { node, min, max, .. } => max != &Some(*min) || node_has_choice_point(node),
+        _ => false,
+    }
+}
+
+fn node_is_alternation(node: &AstNode) -> bool {
+    match node {
+        AstNode::Alternation(_) => true,
+        AstNode::Group { nodes, .. } if nodes.len() == 1 => node_is_alternation(&nodes[0]),
+        _ => false,
+    }
+}
+
+fn node_mutates_ctx(node: &AstNode) -> bool {
+    match node {
+        AstNode::Group {
+            capture: true,
+            index: Some(_),
+            ..
+        } => true,
+        AstNode::Group { nodes, .. } => nodes.iter().any(node_mutates_ctx),
+        AstNode::SetMatchStart | AstNode::SetMatchEnd => true,
+        AstNode::Alternation(alts) => alts.iter().any(|alt| alt.iter().any(node_mutates_ctx)),
+        AstNode::ZeroOrMore { node, .. }
+        | AstNode::OneOrMore { node, .. }
+        | AstNode::Optional { node, .. }
+        | AstNode::Exact { node, .. }
+        | AstNode::Range { node, .. } => node_mutates_ctx(node),
+        _ => false,
+    }
+}
+
 fn max_consumable_bytes(nodes: &[AstNode]) -> Option<usize> {
     let mut total = 0usize;
     for n in nodes {

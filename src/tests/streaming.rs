@@ -2,18 +2,18 @@ use crate::haystack::{Haystack, HaystackCursor};
 use crate::regex::Regex;
 
 #[derive(Clone, Copy, Debug)]
-struct ChunkedHaystack<'a> {
+pub(crate) struct ChunkedHaystack<'a> {
     chunks: &'a [&'a str],
 }
 
 impl<'a> ChunkedHaystack<'a> {
-    fn new(chunks: &'a [&'a str]) -> Self {
+    pub(crate) fn new(chunks: &'a [&'a str]) -> Self {
         Self { chunks }
     }
 }
 
 #[derive(Clone, Debug)]
-struct ChunkedCursor<'a> {
+pub(crate) struct ChunkedCursor<'a> {
     chunks: &'a [&'a str],
     current_chunk: usize,
     chars: std::str::Chars<'a>,

@@ -1,4 +1,4 @@
-use crate::captures::{Captures, Match};
+use crate::captures::{Captures, Match, expand_replacement};
 use std::collections::HashMap;
 
 #[test]
@@ -73,4 +73,68 @@ fn test_captures_optional_groups() {
 
     assert_eq!(captures.as_str(text, 1), Some("hello"));
     assert_eq!(captures.as_str(text, 2), None);
+}
+
+fn caps_for_expand_tests() -> (Captures, &'static str) {
+    let text = "user@example.com";
+    let group1 = Match { start: 0, end: 4 }; // user
+    let group2 = Match { start: 5, end: 12 }; // example
+    let mut named = HashMap::new();
+    named.insert("name".to_string(), group1.clone());
+    named.insert("domain".to_string(), group2.clone());
+    let captures = Captures {
+        full_match: Match { start: 0, end: 16 },
+        groups: vec![Some(group1), Some(group2)],
+        named,
+    };
+    (captures, text)
+}
+
+#[test]
+fn test_expand_replacement_numeric() {
+    let (caps, text) = caps_for_expand_tests();
+    assert_eq!(
+        expand_replacement(&caps, "$1 at $2", text),
+        "user at example"
+    );
+    assert_eq!(
+        expand_replacement(&caps, "<$0>", text),
+        "<user@example.com>"
+    );
+}
+
+#[test]
+fn test_expand_replacement_named() {
+    let (caps, text) = caps_for_expand_tests();
+    assert_eq!(
+        expand_replacement(&caps, "$name @ $domain", text),
+        "user @ example"
+    );
+    assert_eq!(
+        expand_replacement(&caps, "${name}@${domain}.com", text),
+        "user@example.com"
+    );
+}
+
+#[test]
+fn test_expand_replacement_literal_dollar() {
+    let (caps, text) = caps_for_expand_tests();
+    assert_eq!(expand_replacement(&caps, "$$$1", text), "$user");
+    assert_eq!(
+        expand_replacement(&caps, "no refs here", text),
+        "no refs here"
+    );
+}
+
+#[test]
+fn test_expand_replacement_out_of_range_is_empty() {
+    let (caps, text) = caps_for_expand_tests();
+    assert_eq!(expand_replacement(&caps, "[$9]", text), "[]");
+    assert_eq!(expand_replacement(&caps, "[$unknown]", text), "[]");
+}
+
+#[test]
+fn test_expand_replacement_trailing_dollar() {
+    let (caps, text) = caps_for_expand_tests();
+    assert_eq!(expand_replacement(&caps, "total: $", text), "total: $");
 }

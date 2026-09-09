@@ -10,7 +10,11 @@ fn test_stub_find() {
 #[test]
 fn test_stub_captures() {
     let re = Regex::new("abc", Flags::default()).unwrap();
-    assert!(re.captures("abc").is_none());
+    // No capture groups in the pattern, but "abc" matches - captures()
+    // reports the full match with an empty group list.
+    let caps = re.captures("abc").unwrap();
+    assert_eq!(caps.get(0).unwrap().as_str("abc"), "abc");
+    assert!(caps.groups.is_empty());
 }
 
 #[test]
@@ -36,5 +40,5 @@ fn test_stub_iterators() {
     assert!(matches.len() == 2);
 
     let captures: Vec<_> = re.captures_all(text).collect();
-    assert!(captures.is_empty());
+    assert_eq!(captures.len(), 2);
 }

@@ -1,4 +1,4 @@
-﻿use super::nfa::{Nfa, State};
+use super::nfa::{Nfa, State};
 use crate::captures::Match;
 use crate::haystack::Haystack;
 use crate::parser::CharClass;
@@ -55,14 +55,6 @@ impl StartFilter {
 
 // -- Boundary-wrapper postcondition -------------------------------------------
 
-/// A zero-width assertion that can be verified as an O(1) postcondition on a
-/// candidate match's start/end position, rather than folded into NFA
-/// simulation. Licensed only when the assertion appears solely as a leading
-/// and/or trailing run around a core with no assertions anywhere inside it
-/// (see `split_boundary_wrapper` in `mod.rs`) - a shape under which the core's
-/// match at a given start position is already unique (literal / fixed-length
-/// / disjoint-segments all guarantee this), so checking the assertion after
-/// the fact is equivalent to checking it inline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoundaryKind {
     WordBoundary,
@@ -89,30 +81,14 @@ pub fn check_all_boundaries<H: Haystack>(kinds: &[BoundaryKind], text: &H, pos: 
 
 // -- Multi-literal fast path (alternation of literals) ------------------------
 
-/// Fast path for a pattern that's a pure alternation of literals (e.g.
-/// `GET|POST|PUT|DELETE`), bypassing NFA simulation entirely. Matching is a
-/// first-byte filter (reusing `StartFilter`) followed by a linear scan over
-/// the branches sharing that byte, longest-first so leftmost-longest
-/// semantics fall out without any backtracking: the first branch that
-/// verifies at a candidate position is already the correct (longest) one.
-///
-/// A real trie/Aho-Corasick automaton would be the asymptotically better
-/// answer for large branch counts or long shared prefixes, but for the
-/// handful of short, mostly-distinct-prefix branches this shape is typically
-/// used for for (HTTP methods, keywords, ...), a linear per-candidate scan
-/// is already close to optimal and far simpler to keep correct. Capped at a
-/// small branch count (see `alternation_of_literals` in `mod.rs`) so this
-/// never becomes the wrong tool for a large multi-pattern search.
 pub struct MultiLiteral {
-    /// Sorted longest-first (see doc comment above).
     literals: Vec<Box<[u8]>>,
     case_insensitive: bool,
     start_filter: StartFilter,
 }
 
 impl MultiLiteral {
-    pub fn new(mut literals: Vec<Box<[u8]>>, case_insensitive: bool) -> Self {
-        literals.sort_by(|a, b| b.len().cmp(&a.len()));
+    pub fn new(literals: Vec<Box<[u8]>>, case_insensitive: bool) -> Self {
         let mut first_bytes: Vec<u8> = literals
             .iter()
             .flat_map(|lit| {
@@ -205,19 +181,6 @@ impl<'h, 'v> Iterator for MultiLiteralFindAll<'h, 'v> {
 
 // -- Unicode single-class-run fast path ---------------------------------------
 
-/// Fast path for a pattern that's a single quantified character class with
-/// nothing else (e.g. `\w+`, `\W*`, `\s{2,5}`) *and* whose class isn't
-/// ASCII-only (see `class_is_ascii_only`) - so `bp_nfa_ascii` can't cover it
-/// once the haystack turns out to have non-ASCII bytes. Matches via direct
-/// UTF-8-decoding greedy scan (`read_char` per character) instead of the
-/// general per-char NFA interpreter: still O(chars), but with none of the
-/// thread-simulation/epsilon-closure overhead, since a single atom has no
-/// structure to simulate.
-///
-/// ASCII-only classes deliberately skip this path (see `unicode_class_run`
-/// in `mod.rs`) - `bp_nfa_ascii`'s flat byte table is already the better
-/// fast path whenever the haystack is ASCII, and per-char UTF-8 decoding
-/// would only add overhead there for no benefit.
 pub struct UnicodeClassRun {
     class: CharClass,
     ignore_case: bool,
@@ -227,7 +190,13 @@ pub struct UnicodeClassRun {
 }
 
 impl UnicodeClassRun {
-    pub fn new(class: CharClass, ignore_case: bool, dotall: bool, min: usize, max: Option<usize>) -> Self {
+    pub fn new(
+        class: CharClass,
+        ignore_case: bool,
+        dotall: bool,
+        min: usize,
+        max: Option<usize>,
+    ) -> Self {
         Self {
             class,
             ignore_case,
@@ -239,11 +208,6 @@ impl UnicodeClassRun {
 
     pub fn find_in(&self, bytes: &[u8], start: usize) -> Option<Match> {
         if self.min == 0 {
-            // A min=0 run always succeeds at `start` itself, possibly with
-            // zero length - no skip-ahead. Matches `find_via_segments`'s
-            // convention for a `min == 0` first segment (see its doc
-            // comment): the caller is responsible for advancing past a
-            // zero-length match (see `UnicodeClassRunFindAll::next`).
             if start > bytes.len() {
                 return None;
             }
@@ -283,9 +247,6 @@ impl UnicodeClassRun {
                     end: p,
                 });
             }
-            // Fewer than `min` repetitions in this run - a later start
-            // inside the same run can only find an even shorter run, so
-            // it's safe to resume scanning right after it.
             pos = p;
         }
         None
@@ -300,7 +261,11 @@ pub struct UnicodeClassRunFindAll<'h, 'v> {
 
 impl<'h, 'v> UnicodeClassRunFindAll<'h, 'v> {
     fn new(run: &'v UnicodeClassRun, bytes: &'h [u8], start: usize) -> Self {
-        Self { run, bytes, pos: start }
+        Self {
+            run,
+            bytes,
+            pos: start,
+        }
     }
 }
 
@@ -364,10 +329,6 @@ impl Literal {
     }
 }
 
-/// Find the next case-insensitive occurrence of `needle_lower` (ASCII,
-/// already lowercased - see `extract_literal`) in `haystack` at or after
-/// `start`. Dispatches to a SIMD-accelerated scan on x86_64 (see
-/// `simd_ci`), or the portable chunked-lowering scan on other targets.
 #[inline]
 fn find_ci_from(
     haystack: &[u8],
@@ -404,147 +365,178 @@ const CI_CHUNK: usize = 16384;
 #[cfg(not(target_arch = "x86_64"))]
 const CI_SMALL_THRESHOLD: usize = 4096;
 
-/// SSE2 case-insensitive substring search: a first+last-byte SIMD prefilter
-/// (the same shape as `memchr::memmem`'s own "generic SIMD" algorithm, but
-/// with case-insensitive byte comparisons) followed by scalar verification
-/// of the full needle. SSE2 is part of the x86_64 baseline ABI - guaranteed
-/// present on every x86_64 target - so no runtime feature detection is
-/// needed. Measured at parity with (sometimes faster than) a case-sensitive
-/// `memmem` scan across 1KB-10MB inputs, vs. ~1.2-1.5x slower for the
-/// lowercase-then-`memmem` approach this replaces on this target.
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod simd_ci {
     use std::arch::x86_64::*;
 
-    /// Find the first case-insensitive occurrence of `needle_lower` (ASCII,
-    /// already lowercased, length >= 2) in `haystack` at or after `start`.
-    /// For a one-shot lookup; `find_all` uses `FindIter` instead, which
-    /// amortizes the SIMD register setup across matches (see its doc comment).
     pub(super) fn find_from(haystack: &[u8], needle_lower: &[u8], start: usize) -> Option<usize> {
         FindIter::new(haystack, needle_lower, start)?.next()
     }
 
-    /// Streaming case-insensitive SIMD scan, reused across matches within a
-    /// single `find_all` pass. `find_from` calling this fresh per match would
-    /// re-broadcast the four comparison registers (`_mm_set1_epi8` x4) and
-    /// re-pay a `target_feature`-gated call boundary (which Rust cannot
-    /// inline into a caller lacking that feature) on *every single match* -
-    /// for a dense pattern that is real, measurable overhead. Building the
-    /// registers once in `new` and resuming the scan position across `next()`
-    /// calls removes that per-match tax entirely.
-    pub(crate) struct FindIter<'h, 'n> {
-        haystack: &'h [u8],
-        needle_lower: &'n [u8],
-        pos: usize,
-        v_first_lo: __m128i,
-        v_first_up: __m128i,
-        v_last_lo: __m128i,
-        v_last_up: __m128i,
+    pub(crate) enum FindIter<'h, 'n> {
+        Avx2(Avx2FindIter<'h, 'n>),
+        Sse2(Sse2FindIter<'h, 'n>),
     }
 
     impl<'h, 'n> FindIter<'h, 'n> {
         /// Returns `None` if `needle_lower` is too short for this path
         /// (length < 2) - callers fall back to `naive_ci_find` for that case.
-        pub(super) fn new(haystack: &'h [u8], needle_lower: &'n [u8], start: usize) -> Option<Self> {
+        pub(super) fn new(
+            haystack: &'h [u8],
+            needle_lower: &'n [u8],
+            start: usize,
+        ) -> Option<Self> {
             if needle_lower.len() < 2 {
                 return None;
             }
-            let first = needle_lower[0];
-            let last = needle_lower[needle_lower.len() - 1];
-            let first_up = first.to_ascii_uppercase();
-            let last_up = last.to_ascii_uppercase();
-            // SAFETY: SSE2 is guaranteed available on all x86_64 targets.
-            let (v_first_lo, v_first_up, v_last_lo, v_last_up) = unsafe {
-                (
-                    _mm_set1_epi8(first as i8),
-                    _mm_set1_epi8(first_up as i8),
-                    _mm_set1_epi8(last as i8),
-                    _mm_set1_epi8(last_up as i8),
-                )
-            };
-            Some(Self {
-                haystack,
-                needle_lower,
-                pos: start,
-                v_first_lo,
-                v_first_up,
-                v_last_lo,
-                v_last_up,
-            })
+            if is_x86_feature_detected!("avx2") {
+                Some(FindIter::Avx2(Avx2FindIter::new(
+                    haystack,
+                    needle_lower,
+                    start,
+                )))
+            } else {
+                Some(FindIter::Sse2(Sse2FindIter::new(
+                    haystack,
+                    needle_lower,
+                    start,
+                )))
+            }
         }
 
         pub(super) fn next(&mut self) -> Option<usize> {
-            // SAFETY: SSE2 is guaranteed available on all x86_64 targets.
-            unsafe { self.next_sse2() }
-        }
-
-        #[target_feature(enable = "sse2")]
-        unsafe fn next_sse2(&mut self) -> Option<usize> {
-            let haystack = self.haystack;
-            let needle_lower = self.needle_lower;
-            let n = haystack.len();
-            let l = needle_lower.len();
-            let mut pos = self.pos;
-
-            // A 16-lane chunk starting at `pos` reads haystack[pos..pos+16)
-            // for the first-byte comparison and
-            // haystack[pos+l-1..pos+l-1+16) for the last-byte comparison;
-            // the second (larger) offset is the binding constraint on how
-            // far `pos` may safely go. Deliberately `checked_sub`, not
-            // `saturating_sub`: when `n` is too small for even one full
-            // chunk, `saturating_sub` would clamp to 0 and the loop below
-            // would wrongly attempt `pos = 0` anyway (0 <= 0) even though no
-            // chunk fits - `checked_sub` makes "no valid chunk exists" an
-            // explicit `None` instead of an indistinguishable 0.
-            let simd_limit = n.checked_sub(l - 1 + 16);
-
-            while let Some(limit) = simd_limit
-                && pos <= limit
-            {
-                // SAFETY: `pos <= simd_limit` guarantees `pos + 16 <= n` and
-                // `pos + (l - 1) + 16 <= n`, so both unaligned 16-byte loads
-                // read entirely within `haystack`. `_mm_loadu_si128` has no
-                // alignment requirement.
-                let (chunk_first, chunk_last) = unsafe {
-                    (
-                        _mm_loadu_si128(haystack.as_ptr().add(pos) as *const __m128i),
-                        _mm_loadu_si128(haystack.as_ptr().add(pos + l - 1) as *const __m128i),
-                    )
-                };
-                let eq_first = _mm_or_si128(
-                    _mm_cmpeq_epi8(chunk_first, self.v_first_lo),
-                    _mm_cmpeq_epi8(chunk_first, self.v_first_up),
-                );
-                let eq_last = _mm_or_si128(
-                    _mm_cmpeq_epi8(chunk_last, self.v_last_lo),
-                    _mm_cmpeq_epi8(chunk_last, self.v_last_up),
-                );
-                let mut mask = _mm_movemask_epi8(_mm_and_si128(eq_first, eq_last)) as u32;
-
-                while mask != 0 {
-                    let bit = mask.trailing_zeros() as usize;
-                    mask &= mask - 1;
-                    let cand = pos + bit;
-                    if verify(haystack, needle_lower, cand) {
-                        self.pos = cand + l;
-                        return Some(cand);
-                    }
-                }
-                pos += 16;
+            match self {
+                FindIter::Avx2(it) => it.next(),
+                FindIter::Sse2(it) => it.next(),
             }
-
-            // Scalar tail: fewer than 16 + (l - 1) bytes remain.
-            while pos + l <= n {
-                if verify(haystack, needle_lower, pos) {
-                    self.pos = pos + l;
-                    return Some(pos);
-                }
-                pos += 1;
-            }
-            self.pos = pos;
-            None
         }
     }
+
+    macro_rules! ci_simd_kernel {
+        ($name:ident, $feature:literal, $vec:ty, $lanes:expr, $set1:ident, $loadu:ident, $cmpeq:ident, $or:ident, $and:ident, $movemask:ident, $next_fn:ident) => {
+            pub(crate) struct $name<'h, 'n> {
+                haystack: &'h [u8],
+                needle_lower: &'n [u8],
+                pos: usize,
+                v_first_lo: $vec,
+                v_first_up: $vec,
+                v_last_lo: $vec,
+                v_last_up: $vec,
+            }
+
+            impl<'h, 'n> $name<'h, 'n> {
+                /// Caller must have already checked `needle_lower.len() >= 2`.
+                fn new(haystack: &'h [u8], needle_lower: &'n [u8], start: usize) -> Self {
+                    let first = needle_lower[0];
+                    let last = needle_lower[needle_lower.len() - 1];
+                    let first_up = first.to_ascii_uppercase();
+                    let last_up = last.to_ascii_uppercase();
+                    let (v_first_lo, v_first_up, v_last_lo, v_last_up) = unsafe {
+                        (
+                            $set1(first as i8),
+                            $set1(first_up as i8),
+                            $set1(last as i8),
+                            $set1(last_up as i8),
+                        )
+                    };
+                    Self {
+                        haystack,
+                        needle_lower,
+                        pos: start,
+                        v_first_lo,
+                        v_first_up,
+                        v_last_lo,
+                        v_last_up,
+                    }
+                }
+
+                fn next(&mut self) -> Option<usize> {
+                    // SAFETY: see the safety note on `new` above.
+                    unsafe { self.$next_fn() }
+                }
+
+                #[target_feature(enable = $feature)]
+                unsafe fn $next_fn(&mut self) -> Option<usize> {
+                    let haystack = self.haystack;
+                    let needle_lower = self.needle_lower;
+                    let n = haystack.len();
+                    let l = needle_lower.len();
+                    let mut pos = self.pos;
+
+                    let simd_limit = n.checked_sub(l - 1 + $lanes);
+
+                    while let Some(limit) = simd_limit
+                        && pos <= limit
+                    {
+                        let (chunk_first, chunk_last) = unsafe {
+                            (
+                                $loadu(haystack.as_ptr().add(pos) as *const $vec),
+                                $loadu(haystack.as_ptr().add(pos + l - 1) as *const $vec),
+                            )
+                        };
+                        let eq_first = $or(
+                            $cmpeq(chunk_first, self.v_first_lo),
+                            $cmpeq(chunk_first, self.v_first_up),
+                        );
+                        let eq_last = $or(
+                            $cmpeq(chunk_last, self.v_last_lo),
+                            $cmpeq(chunk_last, self.v_last_up),
+                        );
+                        let mut mask = $movemask($and(eq_first, eq_last)) as u32;
+
+                        while mask != 0 {
+                            let bit = mask.trailing_zeros() as usize;
+                            mask &= mask - 1;
+                            let cand = pos + bit;
+                            if verify(haystack, needle_lower, cand) {
+                                self.pos = cand + l;
+                                return Some(cand);
+                            }
+                        }
+                        pos += $lanes;
+                    }
+
+                    // Scalar tail: fewer than $lanes + (l - 1) bytes remain.
+                    while pos + l <= n {
+                        if verify(haystack, needle_lower, pos) {
+                            self.pos = pos + l;
+                            return Some(pos);
+                        }
+                        pos += 1;
+                    }
+                    self.pos = pos;
+                    None
+                }
+            }
+        };
+    }
+
+    ci_simd_kernel!(
+        Sse2FindIter,
+        "sse2",
+        __m128i,
+        16,
+        _mm_set1_epi8,
+        _mm_loadu_si128,
+        _mm_cmpeq_epi8,
+        _mm_or_si128,
+        _mm_and_si128,
+        _mm_movemask_epi8,
+        next_sse2
+    );
+    ci_simd_kernel!(
+        Avx2FindIter,
+        "avx2",
+        __m256i,
+        32,
+        _mm256_set1_epi8,
+        _mm256_loadu_si256,
+        _mm256_cmpeq_epi8,
+        _mm256_or_si256,
+        _mm256_and_si256,
+        _mm256_movemask_epi8,
+        next_avx2
+    );
 
     #[inline]
     fn verify(haystack: &[u8], needle_lower: &[u8], pos: usize) -> bool {
@@ -618,11 +610,6 @@ fn ci_chunked_search(
     None
 }
 
-// `simd_iter`'s type (`simd_ci::FindIter`) is deliberately crate-private
-// implementation detail; external code only ever reaches this enum through
-// the `Iterator` trait, never by naming or constructing a variant field
-// directly, so it never observes the type-privacy mismatch this would
-// otherwise warn about.
 #[allow(private_interfaces)]
 #[allow(clippy::large_enum_variant)]
 pub enum LiteralFindIter<'h, 'n> {
@@ -633,16 +620,6 @@ pub enum LiteralFindIter<'h, 'n> {
         offset: usize,
         lit_len: usize,
     },
-    /// Case-insensitive. On x86_64, `simd_iter` (when `Some`) is a streaming
-    /// SIMD scan (see `simd_ci::FindIter`) that computes its comparison
-    /// registers once and resumes across matches - calling a fresh one-shot
-    /// search per match would re-pay that setup, plus a `target_feature`
-    /// call boundary Rust won't inline across, on *every single match* of a
-    /// dense pattern. It's `None` when the needle is too short for the SIMD
-    /// path (length < 2) or (on non-x86_64 targets, where the field doesn't
-    /// exist at all) unconditionally, in which case `pos` drives
-    /// `find_ci_from` instead - the portable chunked-lowering scan, or the
-    /// zero-copy single-byte scan for length-1 needles.
     CaseInsensitive {
         haystack: &'h [u8],
         pos: usize,
@@ -697,10 +674,6 @@ impl<'h, 'n> Iterator for LiteralFindIter<'h, 'n> {
                 #[cfg(target_arch = "x86_64")]
                 simd_iter,
             } => {
-                // `simd_iter` is only `Some` when `lit.bytes.len() >= 2` (see
-                // `simd_ci::FindIter::new`), so it's provably non-empty here -
-                // the emptiness guard below only needs to run on the fallback
-                // path, not on every SIMD-path call.
                 #[cfg(target_arch = "x86_64")]
                 if let Some(iter) = simd_iter {
                     let start = iter.next()?;
@@ -770,11 +743,10 @@ impl ThreadList {
         }
     }
 
-    /// O(1) origin lookup.
     #[inline(always)]
-    fn get_origin(&self, pc: usize) -> Option<usize> {
+    fn position_of(&self, pc: usize) -> Option<usize> {
         if self.seen_gen[pc] == self.generation {
-            Some(self.seen_origin[pc])
+            self.states.iter().position(|&s| s == pc)
         } else {
             None
         }
@@ -783,6 +755,76 @@ impl ThreadList {
     #[inline]
     fn is_empty(&self) -> bool {
         self.states.is_empty()
+    }
+}
+
+/// Per-thread payload for `CaptureThreadList`: the match origin (needed for
+/// leftmost resolution, same as `ThreadList`) plus a full capture-slot array.
+struct CaptureThread {
+    origin: usize,
+    slots: Vec<Option<usize>>,
+}
+
+struct CaptureThreadList {
+    states: Vec<usize>,
+    seen_gen: Vec<u32>,
+    data: Vec<CaptureThread>,
+    generation: u32,
+}
+
+impl CaptureThreadList {
+    fn new(num_states: usize, num_slots: usize) -> Self {
+        Self {
+            states: Vec::with_capacity(num_states),
+            seen_gen: vec![0u32; num_states],
+            data: (0..num_states)
+                .map(|_| CaptureThread {
+                    origin: 0,
+                    slots: vec![None; num_slots],
+                })
+                .collect(),
+            generation: 1,
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.states.clear();
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generation = 1;
+        }
+    }
+
+    #[inline(always)]
+    fn contains(&self, pc: usize) -> bool {
+        self.seen_gen[pc] == self.generation
+    }
+
+    /// Insert state at `pc` with `origin`/`slots`. First insertion wins (see
+    /// `add_epsilon_captures`'s priority ordering).
+    fn insert(&mut self, pc: usize, origin: usize, slots: &[Option<usize>]) {
+        if self.seen_gen[pc] != self.generation {
+            self.seen_gen[pc] = self.generation;
+            self.data[pc].origin = origin;
+            self.data[pc].slots.copy_from_slice(slots);
+            self.states.push(pc);
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.states.is_empty()
+    }
+
+    /// See `ThreadList::position_of` - same purpose, same reasoning.
+    #[inline(always)]
+    fn position_of(&self, pc: usize) -> Option<usize> {
+        if self.seen_gen[pc] == self.generation {
+            self.states.iter().position(|&s| s == pc)
+        } else {
+            None
+        }
     }
 }
 
@@ -816,10 +858,6 @@ impl VMContext {
 /// Precomputed table enabling bit-parallel NFA simulation without per-char stack ops.
 /// Only built for patterns with <= 64 NFA states and no zero-width assertions.
 pub struct BitParallelNfa {
-    /// Flat n_states x 256 transition table (row-major, stride = 256).
-    /// Entry `char_transitions[state * 256 + byte]` holds the bitmask of NFA states
-    /// reachable by consuming `byte` from `state`, including epsilon closure.
-    /// Stored as one contiguous allocation for L1/L2 cache locality.
     char_transitions: Box<[u64]>,
     /// Epsilon closure of the start state (the initial DFA state).
     initial: u64,
@@ -828,27 +866,10 @@ pub struct BitParallelNfa {
 }
 
 impl BitParallelNfa {
-    /// Try to build a precomputed table from `nfa`. Returns `None` if the NFA
-    /// has > 64 states or contains zero-width assertions (anchor / word boundary).
-    ///
-    /// Unconditionally safe for any input (ASCII or not): classes that can
-    /// match non-ASCII characters (e.g. `\w`, which is Unicode-aware by
-    /// default in this engine) and `.`/`Any` are excluded, since the table is
-    /// byte-keyed and cannot represent multibyte UTF-8 matching.
     pub fn build(nfa: &Nfa) -> Option<Self> {
         Self::build_inner(nfa, false)
     }
 
-    /// Like `build`, but also accepts `Any` and classes that are only
-    /// "not ASCII-only" because of their multibyte-Unicode behavior (`\w`,
-    /// `\s`, ...). The resulting table is only correct when the haystack it
-    /// is run against is verified all-ASCII first (see `find_raw`): for pure
-    /// ASCII input, Unicode-aware classification of a byte in `0..128` is
-    /// identical to ASCII classification, so the byte-keyed table (already
-    /// only ever populated for `0..=127`, see below) stays exact. Still
-    /// excludes zero-width assertions (position-dependent, unrelated to byte
-    /// encoding) and literal non-ASCII `Char` states (which simply can never
-    /// fire against ASCII-only input - a dead table entry is correct there).
     pub fn build_ascii_gated(nfa: &Nfa) -> Option<Self> {
         Self::build_inner(nfa, true)
     }
@@ -867,10 +888,6 @@ impl BitParallelNfa {
                 | State::WordBoundary(_)
                 | State::WordStart(_)
                 | State::WordEnd(_) => return None,
-                // The table is keyed by single bytes (0..=255) and only populated for
-                // ASCII, so it cannot represent matching of multibyte UTF-8 chars.
-                // Bail out for any consuming state that can match a non-ASCII char;
-                // the char-based Pike VM (`read_char`) handles those correctly.
                 State::Char(c, _) if !c.is_ascii() => return None,
                 State::Any(_) if !ascii_gated => return None,
                 State::Class(class, _) if !ascii_gated && !class_is_ascii_only(class) => {
@@ -965,11 +982,6 @@ fn eps_closure(start: usize, nfa: &Nfa) -> u64 {
 
 const DFA_CACHE_SIZE: usize = 1024;
 
-/// Persistent 1 K-entry direct-mapped cache for `(bitmask, byte) -> next_bitmask`.
-/// Stored inside PikeVM so it is initialised ONCE and reused across all
-/// `find_from` / `find_all` calls.  Entries from a previous call are simply
-/// overwritten on collision - no invalidation needed because the mapping is
-/// purely a function of the NFA transition table (position-independent).
 struct LazyDfaCache {
     keys: [u64; DFA_CACHE_SIZE], // bitmask key (u64::MAX = empty)
     byte: [u8; DFA_CACHE_SIZE],  // byte key
@@ -988,7 +1000,7 @@ impl LazyDfaCache {
 
 // -- PikeVM -------------------------------------------------------------------
 
-use std::cell::UnsafeCell;
+use std::sync::Mutex;
 
 pub struct PikeVM {
     nfa: Nfa,
@@ -997,63 +1009,17 @@ pub struct PikeVM {
     literal: Option<Literal>,
     /// Bit-parallel NFA for fast simulation (None if NFA too large or has assertions).
     bp_nfa: Option<BitParallelNfa>,
-    /// Bit-parallel NFA valid only when the haystack is verified all-ASCII
-    /// (see `find_raw`). Populated when `bp_nfa` was disqualified solely by a
-    /// class/`.` that can match non-ASCII in general (e.g. `\w`), letting
-    /// patterns built from those still take the fast path on ASCII input.
     bp_nfa_ascii: Option<BitParallelNfa>,
-    /// UnsafeCell for zero-overhead interior mutability.
-    /// SAFETY: PikeVM is used single-threaded per find operation.
-    ctx: UnsafeCell<VMContext>,
-    /// Persistent DFA cache: initialised once, reused across all find_from calls.
-    /// SAFETY: same single-threaded guarantee as `ctx`.
-    dfa_cache: UnsafeCell<LazyDfaCache>,
-    /// Memoised `is_ascii()` verdict for `bp_nfa_ascii`, keyed by the exact
-    /// `(ptr, len)` of the last haystack checked.
-    ///
-    /// `find_all` calls `find_raw` once per match against the *same*
-    /// underlying buffer (only `start_index` advances), so without this,
-    /// checking `bytes.is_ascii()` fresh on every call turns an O(n) scan
-    /// into O(n * matches) - the check re-scans from byte 0 every time,
-    /// dominating the very fast path it exists to enable.
-    ascii_cache: std::cell::Cell<(usize, usize, bool)>,
-    /// Set when every match of this pattern consumes exactly the same number
-    /// of bytes (see `fixed_length` in `mod.rs`). Licenses `find_raw_fixed_len`,
-    /// which skips per-position origin tracking entirely: with fixed length,
-    /// `start = end - fixed_len` holds for every thread that can ever reach
-    /// the accept state, so there is no leftmost-vs-longest ambiguity to
-    /// resolve by tracking *which* thread got there.
+    ctx: Mutex<VMContext>,
+    dfa_cache: Mutex<LazyDfaCache>,
+    ascii_cache: Mutex<(usize, usize, bool)>,
     fixed_len: Option<usize>,
-    /// Set when the pattern is a flat concatenation of quantified
-    /// single-atom segments with provably unambiguous greedy consumption
-    /// (see `disjoint_greedy_segments` in `mod.rs`). Licenses
-    /// `find_via_segments`, which needs no NFA simulation at all - just a
-    /// per-segment greedy byte-class scan. Like `bp_nfa_ascii`, only valid
-    /// when the haystack is verified all-ASCII first.
     segments: Option<Vec<super::Segment>>,
-    /// Leading/trailing zero-width assertions stripped from the compiled
-    /// pattern (see `split_boundary_wrapper` in `mod.rs`) and verified as an
-    /// O(1) postcondition on `find_raw`'s result instead. Empty when the
-    /// pattern has no such wrapper - the common case, checked for free via
-    /// `Vec::is_empty`.
     leading_boundary: Vec<BoundaryKind>,
     trailing_boundary: Vec<BoundaryKind>,
-    /// Set when the pattern is a pure alternation of literals (see
-    /// `alternation_of_literals` in `mod.rs`). Checked with top priority in
-    /// `find_raw_unwrapped` - like `literal`, it bypasses NFA simulation
-    /// entirely, and the two are mutually exclusive by construction (a
-    /// pattern that reduces to one literal never also parses as a top-level
-    /// `Alternation` node).
     multi_literal: Option<MultiLiteral>,
-    /// Set for a single quantified non-ASCII-only class (`\w+`, `\W*`, ...) -
-    /// see `UnicodeClassRun`. Checked only after `bp_nfa_ascii` (which
-    /// already covers this shape, faster, whenever the haystack turns out
-    /// to be pure ASCII) fails to apply.
     unicode_class_run: Option<UnicodeClassRun>,
 }
-
-// SAFETY: find operations are inherently single-threaded.
-unsafe impl Sync for PikeVM {}
 
 impl PikeVM {
     pub fn new(
@@ -1062,16 +1028,17 @@ impl PikeVM {
         literal: Option<Literal>,
         fixed_len: Option<usize>,
         segments: Option<Vec<super::Segment>>,
+        priority_safe: bool,
     ) -> Self {
         let num_states = nfa.states.len();
-        let bp_nfa = if literal.is_none() {
+        let bp_nfa = if literal.is_none() && priority_safe {
             BitParallelNfa::build(&nfa)
         } else {
             None // literal path bypasses NFA entirely
         };
         // Only worth building the ASCII-gated table when the strict one
         // failed and there's no literal fast path already covering it.
-        let bp_nfa_ascii = if literal.is_none() && bp_nfa.is_none() {
+        let bp_nfa_ascii = if literal.is_none() && bp_nfa.is_none() && priority_safe {
             BitParallelNfa::build_ascii_gated(&nfa)
         } else {
             None
@@ -1082,9 +1049,9 @@ impl PikeVM {
             literal,
             bp_nfa,
             bp_nfa_ascii,
-            ctx: UnsafeCell::new(VMContext::new(num_states)),
-            dfa_cache: UnsafeCell::new(LazyDfaCache::new()),
-            ascii_cache: std::cell::Cell::new((0, 0, false)),
+            ctx: Mutex::new(VMContext::new(num_states)),
+            dfa_cache: Mutex::new(LazyDfaCache::new()),
+            ascii_cache: Mutex::new((0, 0, false)),
             fixed_len,
             segments,
             leading_boundary: Vec::new(),
@@ -1094,10 +1061,11 @@ impl PikeVM {
         }
     }
 
-    /// Attach postcondition boundary checks (see `BoundaryKind`). Builder
-    /// method so the common no-wrapper case doesn't need extra `PikeVM::new`
-    /// parameters at every call site.
-    pub fn with_boundary(mut self, leading: Vec<BoundaryKind>, trailing: Vec<BoundaryKind>) -> Self {
+    pub fn with_boundary(
+        mut self,
+        leading: Vec<BoundaryKind>,
+        trailing: Vec<BoundaryKind>,
+    ) -> Self {
         self.leading_boundary = leading;
         self.trailing_boundary = trailing;
         self
@@ -1130,9 +1098,6 @@ impl PikeVM {
         &self.trailing_boundary
     }
 
-    /// Returns a single-pass iterator for pure-alternation-of-literals
-    /// patterns on contiguous bytes. `None` if the pattern isn't one (fall
-    /// back to other fast paths / the general engine).
     pub fn multi_literal_find_all<'h, 'vm>(
         &'vm self,
         bytes: &'h [u8],
@@ -1159,12 +1124,13 @@ impl PikeVM {
     #[inline]
     fn is_ascii_cached(&self, bytes: &[u8]) -> bool {
         let key = (bytes.as_ptr() as usize, bytes.len());
-        let (ptr, len, val) = self.ascii_cache.get();
+        let mut cache = self.ascii_cache.lock().unwrap();
+        let (ptr, len, val) = *cache;
         if (ptr, len) == key {
             return val;
         }
         let val = bytes.is_ascii();
-        self.ascii_cache.set((key.0, key.1, val));
+        *cache = (key.0, key.1, val);
         val
     }
 
@@ -1172,10 +1138,6 @@ impl PikeVM {
         self.find_raw(text, start_index)
     }
 
-    /// The bit-parallel table applicable to `bytes` right now, if any: the
-    /// unconditionally-safe one, or the ASCII-gated one when `bytes` is
-    /// verified all-ASCII. Used to pick a streaming `find_all` strategy once
-    /// per call instead of re-deciding (and re-checking `is_ascii`) per match.
     #[inline]
     fn bp_table_for<'v>(&'v self, bytes: &[u8]) -> Option<&'v BitParallelNfa> {
         if let Some(bp) = &self.bp_nfa {
@@ -1189,9 +1151,6 @@ impl PikeVM {
         }
     }
 
-    /// Streaming find-all entry point for the bit-parallel fast path (see
-    /// `BitParallelFindAll`). Returns `None` if no bit-parallel table applies
-    /// to `bytes` right now - callers fall back to the general per-match path.
     pub fn find_all_bitparallel<'v, 'h>(
         &'v self,
         bytes: &'h [u8],
@@ -1201,9 +1160,6 @@ impl PikeVM {
         Some(BitParallelFindAll::new(self, bp, bytes, start))
     }
 
-    /// Streaming find-all entry point for the disjoint-greedy-segments fast
-    /// path (see `find_via_segments`). Returns `None` if it doesn't apply
-    /// (no segments decomposition, or `bytes` isn't all-ASCII).
     pub fn find_all_segments<'v, 'h>(
         &'v self,
         bytes: &'h [u8],
@@ -1228,9 +1184,6 @@ impl PikeVM {
         self.fixed_len
     }
 
-    /// The disjoint-greedy-segments decomposition, if this pattern qualifies
-    /// (see `disjoint_greedy_segments`). Callers must verify the haystack is
-    /// all-ASCII before using it - same contract as `bp_nfa_ascii`.
     #[inline]
     pub fn segments(&self) -> Option<&[super::Segment]> {
         self.segments.as_deref()
@@ -1250,12 +1203,6 @@ impl PikeVM {
             .map(|lit| LiteralFindIter::new(bytes, lit, start))
     }
 
-    /// Find the next match, honoring any boundary postcondition (see
-    /// `BoundaryKind`). Retrying from `m.end` on rejection is only correct
-    /// because a boundary wrapper is only ever attached to a core pattern
-    /// that has exactly one possible match per start position (literal /
-    /// fixed-length / disjoint-segments) - there is no shorter alternative
-    /// at the same start to miss by moving on.
     #[inline]
     pub fn find_raw<H: Haystack>(&self, text: H, start_index: usize) -> Option<Match> {
         if !self.has_boundary() {
@@ -1287,20 +1234,11 @@ impl PikeVM {
                     end: pos + lit.len(),
                 });
             }
-            // Fixed-length fast path: no origin tracking needed at all (see
-            // `fixed_len` and `find_raw_fixed_len`). Checked before the
-            // general bit-parallel path since it's strictly cheaper whenever
-            // it applies.
             if let Some(fixed_len) = self.fixed_len
                 && let Some(bp) = self.bp_table_for(bytes)
             {
                 return self.find_raw_fixed_len(bp, bytes, start_index, fixed_len);
             }
-            // Disjoint-greedy-segments fast path: no NFA/bitmask simulation
-            // at all, just a per-segment greedy byte-class scan (see
-            // `find_via_segments`). Broader than the fixed-length path above
-            // (covers variable-length patterns like `[AC]+G+[TA]+`) but
-            // still only reached when fixed-length didn't already apply.
             if let Some(segs) = &self.segments
                 && self.is_ascii_cached(bytes)
             {
@@ -1310,20 +1248,11 @@ impl PikeVM {
             if let Some(bp) = &self.bp_nfa {
                 return self.find_raw_bitparallel(bp, bytes, start_index);
             }
-            // ASCII-gated bit-parallel NFA: same fast path for patterns using
-            // Unicode-aware classes (`\w`, `\s`, ...), valid whenever the
-            // haystack turns out to be pure ASCII. `is_ascii()` is a single
-            // SIMD-accelerated scan, far cheaper than the generic per-char
-            // PikeVM it lets us skip.
             if let Some(bp) = &self.bp_nfa_ascii
                 && self.is_ascii_cached(bytes)
             {
                 return self.find_raw_bitparallel(bp, bytes, start_index);
             }
-            // Unicode single-class-run: covers exactly the case
-            // `bp_nfa_ascii` just missed above (non-ASCII haystack) for a
-            // pattern that's a single quantified class, via direct
-            // UTF-8-decoding scan instead of the general char-based PikeVM.
             if let Some(run) = &self.unicode_class_run {
                 return run.find_in(bytes, start_index);
             }
@@ -1338,14 +1267,6 @@ impl PikeVM {
 
     // -- Fixed-length execution -------------------------------------------------
 
-    /// Bit-parallel scan for a pattern whose every match is exactly
-    /// `fixed_len` bytes long (see `fixed_length` in `mod.rs`). No per-position
-    /// origin tracking: since *every* thread that can ever reach the accept
-    /// state has consumed exactly `fixed_len` bytes to get there, the first
-    /// position at which the accept bit turns on is, by construction, both
-    /// the leftmost match *and* unambiguous about where it started
-    /// (`start = end - fixed_len`) - there is no "which thread got there"
-    /// question to resolve, so this returns on the very first hit.
     #[inline(always)]
     fn find_raw_fixed_len(
         &self,
@@ -1360,8 +1281,8 @@ impl PikeVM {
         let mut current: u64 = 0;
         let mut pos = start_index;
 
-        // SAFETY: single-threaded per find operation (see `dfa_cache`).
-        let cache = unsafe { &mut *self.dfa_cache.get() };
+        let mut cache_guard = self.dfa_cache.lock().unwrap();
+        let cache = &mut *cache_guard;
         let ck = &mut cache.keys;
         let cb = &mut cache.byte;
         let cv = &mut cache.val;
@@ -1438,22 +1359,6 @@ impl PikeVM {
 
     // -- Bit-parallel execution ------------------------------------------------
 
-    /// Fast NFA simulation using a precomputed flat 256-column transition table.
-    ///
-    /// Three key optimisations:
-    ///
-    /// 1. **Flat contiguous table** - `char_transitions` is one Box<[u64]> with
-    ///    stride 256 so that all rows fit in L1/L2 cache without pointer chasing.
-    ///
-    /// 2. **Stable-bitmask shortcut** - when `next == current` (no state gained
-    ///    or lost), origins are already at their historical minimum and the entire
-    ///    O(active) origin-update loop is skipped.  Loops like `[AC]+` and `\w+`
-    ///    keep a stable bitmask for runs of matching bytes, collapsing per-byte
-    ///    cost to a table lookup + comparison.
-    ///
-    /// 3. **Lazy DFA cache** - 1 K direct-mapped slots cache `(bitmask, byte) ->
-    ///    next_bitmask`.  On repeated `(current, byte)` pairs the O(active) loop
-    ///    is also skipped for the transition itself.
     #[inline(always)]
     fn find_raw_bitparallel(
         &self,
@@ -1472,10 +1377,8 @@ impl PikeVM {
         let mut current: u64 = 0;
         let mut pos = start_index;
 
-        // Persistent DFA cache: borrow the PikeVM-level cache (initialised once,
-        // never re-zeroed between calls) via the existing UnsafeCell.
-        // SAFETY: single-threaded per find operation (see struct comment).
-        let cache = unsafe { &mut *self.dfa_cache.get() };
+        let mut cache_guard = self.dfa_cache.lock().unwrap();
+        let cache = &mut *cache_guard;
         let ck = &mut cache.keys;
         let cb = &mut cache.byte;
         let cv = &mut cache.val;
@@ -1546,19 +1449,7 @@ impl PikeVM {
                 nxt
             };
 
-            // 4. Update origins - skipped on stable bitmask (the common case for
-            //    loop bodies like [AC]+ or \w+).  When next == current no state
-            //    was gained or lost, so all origins are already at their minimum.
-            if next != current {
-                // Snapshot pre-transition origins before mutating anything.
-                // Without this, a bit that is BOTH a target written earlier
-                // in the loop below (because a lower-numbered source feeds
-                // it) AND a source read later in the same loop (when its own
-                // turn as `i` comes up) would read its own just-written
-                // *post*-transition value instead of the pre-transition one
-                // it must contribute as a source - silently corrupting
-                // whichever downstream target it feeds, depending on bit
-                // iteration order.
+            {
                 let old_origins = origins;
 
                 // a. Reset stale values for bits that are newly active (0->1).
@@ -1569,18 +1460,6 @@ impl PikeVM {
                     nb &= nb - 1;
                     origins[j] = usize::MAX;
                 }
-                // a2. A bit can also persist (stay set from `current` into
-                //     `next`) WITHOUT looping back to itself this byte - e.g.
-                //     a dead-end accepting state that a *different* source
-                //     re-targets fresh this round. Its old origin describes an
-                //     occupant that did not actually survive this step, so it
-                //     must not be allowed to win the min-compare in (b) against
-                //     a genuinely later candidate. Reset it unless state `j`
-                //     itself transitions back into `j` (a real self-loop,
-                //     where carrying the old origin forward is correct and
-                //     intended - see the `(ab)+` case below). Safe to reset
-                //     `origins[j]` here (rather than `old_origins[j]`) since
-                //     (b) below only ever reads from the untouched snapshot.
                 let persisting = next & current;
                 let mut p = persisting;
                 while p != 0 {
@@ -1592,13 +1471,6 @@ impl PikeVM {
                         origins[j] = usize::MAX;
                     }
                 }
-                // b. Propagate min origin from every source to every target in
-                //    `next`.  Must cover ALL targets (not only newly-active ones)
-                //    because back-edges (e.g. the loop in `(ab)+`) can deliver a
-                //    smaller origin to an already-active state. Sources are read
-                //    from `old_origins` (frozen pre-transition), never from
-                //    `origins` (being written here), so iteration order over
-                //    `current`'s bits can't affect the result.
                 let mut active = current;
                 while active != 0 {
                     let i = active.trailing_zeros() as usize;
@@ -1642,24 +1514,6 @@ impl PikeVM {
     // -- Epsilon closure ------------------------------------------------------
 }
 
-/// Streaming `find_all` iterator for the bit-parallel fast path.
-///
-/// `find_all` needs one match at a time, but the general-purpose path gets
-/// there by calling the single-match matcher fresh for every match found -
-/// each call re-derives which fast path applies, re-checks the start filter,
-/// and (before this type existed) re-zeroed a 64-entry origins array. For
-/// patterns with dense matches (e.g. a match every few bytes) that fixed
-/// per-call cost, paid thousands of times, dominated the actual per-byte
-/// scanning work it was wrapping.
-///
-/// This iterator instead runs the exact same leftmost-longest thread
-/// simulation as `find_raw_bitparallel`, but keeps `origins` as iterator
-/// state reused across matches instead of a fresh array per match. This is
-/// sound because `origins[i]` is only ever read while bit `i` is active in
-/// `current`/`next` *within the search for the current match* - and any such
-/// bit was necessarily assigned a fresh value earlier in that same search
-/// (via the initial spawn step or the newly-active transfer step below), so
-/// leftover values from a previous match's search are never observed.
 pub struct BitParallelFindAll<'v, 'h> {
     vm: &'v PikeVM,
     bp: &'v BitParallelNfa,
@@ -1701,8 +1555,8 @@ impl<'v, 'h> Iterator for BitParallelFindAll<'v, 'h> {
         let mut current: u64 = 0;
         let mut pos = self.pos;
 
-        // SAFETY: single-threaded per find operation (see `PikeVM::dfa_cache`).
-        let cache = unsafe { &mut *self.vm.dfa_cache.get() };
+        let mut cache_guard = self.vm.dfa_cache.lock().unwrap();
+        let cache = &mut *cache_guard;
         let ck = &mut cache.keys;
         let cb = &mut cache.byte;
         let cv = &mut cache.val;
@@ -1774,12 +1628,9 @@ impl<'v, 'h> Iterator for BitParallelFindAll<'v, 'h> {
                 nxt
             };
 
-            if next != current {
-                // See the matching comment in `find_raw_bitparallel`: snapshot
-                // pre-transition origins before mutating anything, so a bit
-                // written as a target earlier in the loop below (by a
-                // lower-numbered source) can't corrupt its own value when it
-                // is later read as a source (when its turn as `i` comes up).
+            // See `find_raw_bitparallel`'s matching block for why this can't
+            // be skipped when `next == current` (it used to be, unsoundly).
+            {
                 let old_origins = self.origins;
 
                 let newly = next & !current;
@@ -1789,10 +1640,6 @@ impl<'v, 'h> Iterator for BitParallelFindAll<'v, 'h> {
                     nb &= nb - 1;
                     self.origins[j] = usize::MAX;
                 }
-                // A bit that persists into `next` without a genuine self-loop
-                // this byte must not have its stale origin win the
-                // min-compare below against a later, genuinely-fresh
-                // candidate that reaches this state index via another source.
                 let persisting = next & current;
                 let mut p = persisting;
                 while p != 0 {
@@ -1853,10 +1700,6 @@ impl<'v, 'h> Iterator for BitParallelFindAll<'v, 'h> {
     }
 }
 
-/// Streaming `find_all` iterator for the fixed-length fast path (see
-/// `PikeVM::find_raw_fixed_len`). No origin array at all - fixed length means
-/// `start = end - fixed_len` unconditionally, so there is nothing to track
-/// across bytes beyond the current bitmask itself.
 pub struct FixedLenFindAll<'v, 'h> {
     vm: &'v PikeVM,
     bp: &'v BitParallelNfa,
@@ -1901,8 +1744,8 @@ impl<'v, 'h> Iterator for FixedLenFindAll<'v, 'h> {
         let mut current: u64 = 0;
         let mut pos = self.pos;
 
-        // SAFETY: single-threaded per find operation (see `PikeVM::dfa_cache`).
-        let cache = unsafe { &mut *self.vm.dfa_cache.get() };
+        let mut cache_guard = self.vm.dfa_cache.lock().unwrap();
+        let cache = &mut *cache_guard;
         let ck = &mut cache.keys;
         let cb = &mut cache.byte;
         let cv = &mut cache.val;
@@ -1995,8 +1838,8 @@ impl PikeVM {
             match nfa.states[sid] {
                 State::Jump(next) => stack.push((next, orig)),
                 State::Split(s1, s2) => {
-                    stack.push((s1, orig));
                     stack.push((s2, orig));
+                    stack.push((s1, orig));
                 }
                 State::Save(_, next) => stack.push((next, orig)),
                 State::AnchorStart(next) => {
@@ -2038,8 +1881,8 @@ impl PikeVM {
         bytes: &[u8],
         start_index: usize,
     ) -> Option<Match> {
-        // SAFETY: single-threaded find operation
-        let ctx = unsafe { &mut *self.ctx.get() };
+        let mut ctx_guard = self.ctx.lock().unwrap();
+        let ctx = &mut *ctx_guard;
         ctx.reset();
 
         let len = text.len();
@@ -2073,21 +1916,13 @@ impl PikeVM {
             }
 
             // Check for accepting state.
-            if let Some(origin) = ctx.current.get_origin(self.nfa.match_state) {
-                let new_match = Match {
+            if let Some(match_idx) = ctx.current.position_of(self.nfa.match_state) {
+                let origin = ctx.current.seen_origin[self.nfa.match_state];
+                best_match = Some(Match {
                     start: origin,
                     end: pos,
-                };
-                let replace = match &best_match {
-                    None => true,
-                    Some(e) => {
-                        new_match.start < e.start
-                            || (new_match.start == e.start && new_match.end > e.end)
-                    }
-                };
-                if replace {
-                    best_match = Some(new_match);
-                }
+                });
+                ctx.current.states.truncate(match_idx);
             }
 
             if pos == len {
@@ -2132,8 +1967,8 @@ impl PikeVM {
         bytes: &[u8],
         start_index: usize,
     ) -> Option<Match> {
-        // SAFETY: single-threaded find operation
-        let ctx = unsafe { &mut *self.ctx.get() };
+        let mut ctx_guard = self.ctx.lock().unwrap();
+        let ctx = &mut *ctx_guard;
         ctx.reset();
 
         let len = text.len();
@@ -2154,21 +1989,13 @@ impl PikeVM {
                 );
             }
 
-            if let Some(origin) = ctx.current.get_origin(self.nfa.match_state) {
-                let new_match = Match {
+            if let Some(match_idx) = ctx.current.position_of(self.nfa.match_state) {
+                let origin = ctx.current.seen_origin[self.nfa.match_state];
+                best_match = Some(Match {
                     start: origin,
                     end: pos,
-                };
-                let replace = match &best_match {
-                    None => true,
-                    Some(e) => {
-                        new_match.start < e.start
-                            || (new_match.start == e.start && new_match.end > e.end)
-                    }
-                };
-                if replace {
-                    best_match = Some(new_match);
-                }
+                });
+                ctx.current.states.truncate(match_idx);
             }
 
             if pos == len {
@@ -2208,8 +2035,8 @@ impl PikeVM {
 
     /// Fallback for non-contiguous haystacks: character-by-character NFA simulation.
     fn find_raw_char<H: Haystack>(&self, text: H, start_index: usize) -> Option<Match> {
-        // SAFETY: single-threaded find operation
-        let ctx = unsafe { &mut *self.ctx.get() };
+        let mut ctx_guard = self.ctx.lock().unwrap();
+        let ctx = &mut *ctx_guard;
         ctx.reset();
 
         let len = text.len();
@@ -2230,21 +2057,13 @@ impl PikeVM {
                 );
             }
 
-            if let Some(origin) = ctx.current.get_origin(self.nfa.match_state) {
-                let new_match = Match {
+            if let Some(match_idx) = ctx.current.position_of(self.nfa.match_state) {
+                let origin = ctx.current.seen_origin[self.nfa.match_state];
+                best_match = Some(Match {
                     start: origin,
                     end: pos,
-                };
-                let replace = match &best_match {
-                    None => true,
-                    Some(e) => {
-                        new_match.start < e.start
-                            || (new_match.start == e.start && new_match.end > e.end)
-                    }
-                };
-                if replace {
-                    best_match = Some(new_match);
-                }
+                });
+                ctx.current.states.truncate(match_idx);
             }
 
             if pos == len {
@@ -2283,6 +2102,148 @@ impl PikeVM {
         }
 
         best_match
+    }
+
+
+    pub fn find_captures<H: Haystack>(
+        &self,
+        text: H,
+        start_index: usize,
+        num_slots: usize,
+    ) -> Option<(Match, Vec<Option<usize>>)> {
+        let num_states = self.nfa.states.len();
+        let mut current = CaptureThreadList::new(num_states, num_slots);
+        let mut next_list = CaptureThreadList::new(num_states, num_slots);
+        let mut stack: Vec<(usize, usize, Vec<Option<usize>>)> = Vec::new();
+
+        let len = text.len();
+        let mut best: Option<(Match, Vec<Option<usize>>)> = None;
+        let mut pos = start_index;
+
+        while pos <= len {
+            let spawn_ok = best.as_ref().is_none_or(|(m, _)| pos <= m.start);
+            if spawn_ok {
+                Self::add_epsilon_captures(
+                    &self.nfa,
+                    &mut current,
+                    &mut stack,
+                    self.nfa.start,
+                    pos,
+                    vec![None; num_slots],
+                    pos,
+                    &text,
+                );
+            }
+
+            if let Some(match_idx) = current.position_of(self.nfa.match_state) {
+                let thread = &current.data[self.nfa.match_state];
+                let new_match = Match {
+                    start: thread.origin,
+                    end: pos,
+                };
+                best = Some((new_match, thread.slots.clone()));
+                current.states.truncate(match_idx);
+            }
+
+            if pos == len {
+                break;
+            }
+
+            let (char_val, char_len) = match text.char_at(pos) {
+                Some(c) => c,
+                None => break,
+            };
+            next_list.clear();
+
+            for i in 0..current.states.len() {
+                let pc = current.states[i];
+                let origin = current.data[pc].origin;
+                let slots = current.data[pc].slots.clone();
+                if let Some(next_id) = self.get_next_state(pc, char_val) {
+                    Self::add_epsilon_captures(
+                        &self.nfa,
+                        &mut next_list,
+                        &mut stack,
+                        next_id,
+                        origin,
+                        slots,
+                        pos + char_len,
+                        &text,
+                    );
+                }
+            }
+
+            std::mem::swap(&mut current, &mut next_list);
+
+            if best.is_some() && current.is_empty() {
+                break;
+            }
+
+            pos += char_len;
+        }
+
+        best
+    }
+
+    fn add_epsilon_captures<H: Haystack>(
+        nfa: &Nfa,
+        list: &mut CaptureThreadList,
+        stack: &mut Vec<(usize, usize, Vec<Option<usize>>)>,
+        state_id: usize,
+        origin: usize,
+        slots: Vec<Option<usize>>,
+        pos: usize,
+        text: &H,
+    ) {
+        stack.push((state_id, origin, slots));
+        while let Some((sid, orig, slots)) = stack.pop() {
+            if list.contains(sid) {
+                continue; // already active this round, first (highest-priority) claim wins
+            }
+            list.insert(sid, orig, &slots);
+            match &nfa.states[sid] {
+                State::Jump(next) => stack.push((*next, orig, slots)),
+                State::Split(s1, s2) => {
+                    // Push s2 first so s1 - the greedy-preferred branch by
+                    // construction - pops (and fully explores) first.
+                    stack.push((*s2, orig, slots.clone()));
+                    stack.push((*s1, orig, slots));
+                }
+                State::Save(slot, next) => {
+                    let mut s = slots;
+                    if *slot < s.len() {
+                        s[*slot] = Some(pos);
+                    }
+                    stack.push((*next, orig, s));
+                }
+                State::AnchorStart(next) => {
+                    if pos == 0 {
+                        stack.push((*next, orig, slots));
+                    }
+                }
+                State::AnchorEnd(next) => {
+                    if pos == text.len() {
+                        stack.push((*next, orig, slots));
+                    }
+                }
+                State::WordBoundary(next) => {
+                    if is_word_boundary(text, pos) {
+                        stack.push((*next, orig, slots));
+                    }
+                }
+                State::WordStart(next) => {
+                    if is_word_start(text, pos) {
+                        stack.push((*next, orig, slots));
+                    }
+                }
+                State::WordEnd(next) => {
+                    if is_word_end(text, pos) {
+                        stack.push((*next, orig, slots));
+                    }
+                }
+                _ => {} // consuming state - nothing to follow
+            }
+        }
     }
 
     // -- State transitions -----------------------------------------------------
@@ -2367,11 +2328,6 @@ impl PikeVM {
 
 // -- Disjoint-greedy-segments execution ----------------------------------------
 
-/// Match `segs` starting exactly at `start`, consuming each segment greedily
-/// (up to its `max`), requiring at least `min`. Under the disjointness
-/// invariant `disjoint_greedy_segments` verified at compile time, this is the
-/// *only* possible decomposition: if it fails, no decomposition starting at
-/// `start` exists at all, so there is nothing to backtrack into.
 #[inline]
 fn match_segments_from(segs: &[super::Segment], bytes: &[u8], start: usize) -> Option<usize> {
     let n = bytes.len();
@@ -2400,22 +2356,16 @@ fn greedy_run_len(bytes: &[u8], pos: usize, alphabet: &super::SegBits) -> usize 
     count
 }
 
-/// Find the leftmost match of `segs` starting at or after `start_index`.
-///
-/// Scans candidate starts left to right, verifying each via
-/// `match_segments_from`. On failure, if the first segment is unbounded
-/// (`max == usize::MAX`), every start within the current run of its alphabet
-/// fails identically - greedy consumption always eats the whole run
-/// regardless of where within it you start, so they all hit the exact same
-/// downstream wall - so the whole run is skipped in one step rather than
-/// retried byte by byte.
 fn find_via_segments(segs: &[super::Segment], bytes: &[u8], start_index: usize) -> Option<Match> {
     let n = bytes.len();
     let mut pos = start_index;
     let first = &segs[0];
     while pos <= n {
         if first.min >= 1 {
-            match bytes[pos..].iter().position(|&b| first.alphabet.contains(b)) {
+            match bytes[pos..]
+                .iter()
+                .position(|&b| first.alphabet.contains(b))
+            {
                 Some(off) => pos += off,
                 None => return None,
             }
@@ -2538,9 +2488,6 @@ pub(crate) fn matches_class_static(class: &CharClass, c: char, ic: bool, dotall:
     }
 }
 
-/// Decode one character from `bytes[pos]`. ASCII fast path avoids UTF-8 decode.
-///
-/// SAFETY invariant (upheld by callers): `pos` is always a char boundary.
 #[inline(always)]
 fn read_char(bytes: &[u8], pos: usize) -> (char, usize) {
     let b = bytes[pos];
@@ -2569,4 +2516,3 @@ fn is_word_end<H: Haystack>(text: &H, pos: usize) -> bool {
 fn is_word_char(c: Option<char>) -> bool {
     c.is_some_and(|c| c.is_alphanumeric() || c == '_')
 }
-

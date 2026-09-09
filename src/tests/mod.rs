@@ -34,3 +34,19 @@ mod streaming;
 #[cfg(test)]
 #[path = "linear_api.rs"]
 mod linear_api;
+
+#[cfg(test)]
+#[path = "fuzz_oracle.rs"]
+mod fuzz_oracle;
+
+#[cfg(test)]
+#[path = "fuzz_oracle_lookaround.rs"]
+mod fuzz_oracle_lookaround;
+
+#[cfg(test)]
+#[path = "fuzz_oracle_linear.rs"]
+mod fuzz_oracle_linear;
+
+#[cfg(test)]
+#[path = "fuzz_oracle_streaming.rs"]
+mod fuzz_oracle_streaming;

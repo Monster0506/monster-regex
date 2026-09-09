@@ -143,16 +143,15 @@ fn render_bar(value: usize, max_value: usize, width: usize) -> String {
         0
     };
 
-    let bar_chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let full_blocks = filled / 8;
     let remainder = filled % 8;
 
     let mut bar = String::new();
     for _ in 0..full_blocks {
-        bar.push('█');
+        bar.push('#');
     }
     if remainder > 0 && bar.len() < width {
-        bar.push(bar_chars[remainder - 1]);
+        bar.push('#');
     }
     while bar.len() < width {
         bar.push(' ');
@@ -175,7 +174,7 @@ fn format_time(ns: u64) -> String {
     if ns < 1_000 {
         format!("{} ns", ns)
     } else if ns < 1_000_000 {
-        format!("{:.1} µs", ns as f64 / 1_000.0)
+        format!("{:.1} us", ns as f64 / 1_000.0)
     } else if ns < 1_000_000_000 {
         format!("{:.1} ms", ns as f64 / 1_000_000.0)
     } else {
@@ -251,7 +250,7 @@ fn main() {
     for result in &results {
         let bar = render_bar(result.time_ns as usize, max_time as usize, 40);
         println!(
-            "{:<30} │{}│ {}",
+            "{:<30} |{}| {}",
             result.name,
             bar,
             format_time(result.time_ns)
@@ -263,7 +262,7 @@ fn main() {
     for result in &results {
         let bar = render_bar(result.total_allocated, max_mem, 40);
         println!(
-            "{:<30} │{}│ {}",
+            "{:<30} |{}| {}",
             result.name,
             bar,
             format_bytes(result.total_allocated)
@@ -275,7 +274,7 @@ fn main() {
     for result in &results {
         let bar = render_bar(result.peak_memory, max_peak, 40);
         println!(
-            "{:<30} │{}│ {}",
+            "{:<30} |{}| {}",
             result.name,
             bar,
             format_bytes(result.peak_memory)
