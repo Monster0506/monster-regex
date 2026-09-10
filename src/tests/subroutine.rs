@@ -75,6 +75,43 @@ fn test_named_recursion_rejects_unbalanced() {
 }
 
 #[test]
+fn test_balanced_parens_comprehensive() {
+    let re = Regex::new(r"^(?<paren>\((?:[^()]|(?&paren))*\))$", Flags::default()).unwrap();
+
+    let cases: &[(&str, bool)] = &[
+        ("()", true),
+        ("(a)", true),
+        ("(a(b)c)", true),
+        ("((x))", true),
+        ("(a(b(c)d)e)", true),
+        ("((()))", true),
+        ("()()", false),
+        ("(", false),
+        (")", false),
+        ("(()", false),
+        ("())", false),
+        ("(a(b)c", false),
+        ("a(b)c)", false),
+        ("", false),
+        ("abc", false),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(
+            re.is_match(input),
+            *expected,
+            "is_match({input:?}) should be {expected}"
+        );
+    }
+
+    // Unanchored, find() locates a balanced group embedded in surrounding
+    // content, spanning exactly the balanced part.
+    let re_find = Regex::new(r"(?<paren>\((?:[^()]|(?&paren))*\))", Flags::default()).unwrap();
+    let text = "prefix (a(b)c) suffix";
+    let m = re_find.find(text).unwrap();
+    assert_eq!(&text[m.start..m.end], "(a(b)c)");
+}
+
+#[test]
 fn test_named_recursion_balanced_parens() {
     // (?<name>...) defines a group; (?&name) calls it. Same balanced-
     // parens capability as (?R), via an explicitly named self-reference.
